@@ -1,0 +1,113 @@
+/**
+ * These arguments were used when this file was generated. They will be automatically applied on subsequent loads
+ * via the GUI or CLI. Run CLI with '--help' for additional information on how to override these arguments.
+ * @cliArgs --device "MSPM0G350X" --part "Default" --package "LQFP-64(PM)" --product "mspm0_sdk@2.04.00.06"
+ * @v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)" --product "mspm0_sdk@2.04.00.06"
+ * @versions {"tool":"1.23.1+4034"}
+ */
+
+/**
+ * Import the modules used in this configuration.
+ */
+const GPIO    = scripting.addModule("/ti/driverlib/GPIO", {}, false);
+const GPIO1   = GPIO.addInstance();
+const SYSCTL  = scripting.addModule("/ti/driverlib/SYSCTL");
+const SYSTICK = scripting.addModule("/ti/driverlib/SYSTICK");
+const UART    = scripting.addModule("/ti/driverlib/UART", {}, false);
+const UART_PC = UART.addInstance();
+const UART_GYRO = UART.addInstance();
+
+/**
+ * Write custom configuration values to the imported modules.
+ */
+GPIO1.$name                         = "LED_PORT";
+GPIO1.port                          = "PORTB";
+GPIO1.associatedPins[0].$name       = "LED_BLUE";
+GPIO1.associatedPins[0].assignedPin = "22";
+
+const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
+
+SYSCTL.forceDefaultClkConfig = true;
+SYSCTL.clockTreeEn           = true;
+
+SYSTICK.periodEnable      = true;
+SYSTICK.period            = 32000;
+SYSTICK.interruptEnable   = true;
+SYSTICK.systickEnable     = true;
+SYSTICK.interruptPriority = "0";
+
+UART_PC.$name                              = "UART_PC";
+UART_PC.targetBaudRate                     = 115200;
+UART_PC.enableFIFO                         = true;
+UART_PC.rxFifoThreshold                    = "DL_UART_RX_FIFO_LEVEL_ONE_ENTRY";
+UART_PC.txFifoThreshold                    = "DL_UART_TX_FIFO_LEVEL_ONE_ENTRY";
+UART_PC.rxTimeoutValue                     = 15;
+UART_PC.enabledInterrupts                  = ["DMA_DONE_RX","DMA_DONE_TX","EOT_DONE","RX_TIMEOUT_ERROR"];
+UART_PC.enabledDMARXTriggers               = "DL_UART_DMA_INTERRUPT_RX";
+UART_PC.enabledDMATXTriggers               = "DL_UART_DMA_INTERRUPT_TX";
+UART_PC.enableDMARX                        = true;
+UART_PC.enableDMATX                        = true;
+UART_PC.peripheral.$assign                 = "UART0";
+UART_PC.peripheral.rxPin.$assign           = "PA11";
+UART_PC.peripheral.txPin.$assign           = "PA10";
+UART_PC.rxPinConfig.enableConfig           = true;
+UART_PC.rxPinConfig.internalResistor       = "PULL_UP";
+UART_PC.txPinConfig.enableConfig           = true;
+UART_PC.txPinConfig.internalResistor       = "PULL_UP";
+UART_PC.DMA_CHANNEL_RX.$name               = "DMA_PC_RX";
+UART_PC.DMA_CHANNEL_RX.addressMode         = "f2b";
+UART_PC.DMA_CHANNEL_RX.srcLength           = "BYTE";
+UART_PC.DMA_CHANNEL_RX.dstLength           = "BYTE";
+UART_PC.DMA_CHANNEL_RX.configureTransferSize = true;
+UART_PC.DMA_CHANNEL_RX.transferSize        = 128;
+UART_PC.DMA_CHANNEL_RX.destIncrement       = "INCREMENT";
+UART_PC.DMA_CHANNEL_RX.peripheral.$assign  = "DMA_CH0";
+UART_PC.DMA_CHANNEL_TX.$name               = "DMA_PC_TX";
+UART_PC.DMA_CHANNEL_TX.addressMode         = "b2f";
+UART_PC.DMA_CHANNEL_TX.srcLength           = "BYTE";
+UART_PC.DMA_CHANNEL_TX.dstLength           = "BYTE";
+UART_PC.DMA_CHANNEL_TX.srcIncrement        = "INCREMENT";
+UART_PC.DMA_CHANNEL_TX.peripheral.$assign  = "DMA_CH1";
+
+UART_GYRO.$name                            = "UART_GYRO";
+UART_GYRO.targetBaudRate                   = 115200;
+UART_GYRO.enableFIFO                       = true;
+UART_GYRO.rxFifoThreshold                  = "DL_UART_RX_FIFO_LEVEL_ONE_ENTRY";
+UART_GYRO.txFifoThreshold                  = "DL_UART_TX_FIFO_LEVEL_ONE_ENTRY";
+UART_GYRO.rxTimeoutValue                   = 15;
+UART_GYRO.enabledInterrupts                = ["DMA_DONE_RX","DMA_DONE_TX","EOT_DONE","RX_TIMEOUT_ERROR"];
+UART_GYRO.enabledDMARXTriggers             = "DL_UART_DMA_INTERRUPT_RX";
+UART_GYRO.enabledDMATXTriggers             = "DL_UART_DMA_INTERRUPT_TX";
+UART_GYRO.enableDMARX                      = true;
+UART_GYRO.enableDMATX                      = true;
+UART_GYRO.peripheral.$assign               = "UART1";
+UART_GYRO.peripheral.rxPin.$assign         = "PA9";
+UART_GYRO.peripheral.txPin.$assign         = "PA8";
+UART_GYRO.rxPinConfig.enableConfig         = true;
+UART_GYRO.rxPinConfig.internalResistor     = "PULL_UP";
+UART_GYRO.txPinConfig.enableConfig         = true;
+UART_GYRO.txPinConfig.internalResistor     = "PULL_UP";
+UART_GYRO.DMA_CHANNEL_RX.$name             = "DMA_GYRO_RX";
+UART_GYRO.DMA_CHANNEL_RX.addressMode       = "f2b";
+UART_GYRO.DMA_CHANNEL_RX.srcLength         = "BYTE";
+UART_GYRO.DMA_CHANNEL_RX.dstLength         = "BYTE";
+UART_GYRO.DMA_CHANNEL_RX.configureTransferSize = true;
+UART_GYRO.DMA_CHANNEL_RX.transferSize      = 128;
+UART_GYRO.DMA_CHANNEL_RX.destIncrement     = "INCREMENT";
+UART_GYRO.DMA_CHANNEL_RX.peripheral.$assign = "DMA_CH2";
+UART_GYRO.DMA_CHANNEL_TX.$name             = "DMA_GYRO_TX";
+UART_GYRO.DMA_CHANNEL_TX.addressMode       = "b2f";
+UART_GYRO.DMA_CHANNEL_TX.srcLength         = "BYTE";
+UART_GYRO.DMA_CHANNEL_TX.dstLength         = "BYTE";
+UART_GYRO.DMA_CHANNEL_TX.srcIncrement      = "INCREMENT";
+UART_GYRO.DMA_CHANNEL_TX.peripheral.$assign = "DMA_CH3";
+
+/**
+ * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
+ * version of the tool will not impact the pinmux you originally saw.  These lines can be completely deleted in order to
+ * re-solve from scratch.
+ */
+GPIO1.associatedPins[0].pin.$suggestSolution = "PB22";
+Board.peripheral.$suggestSolution            = "DEBUGSS";
+Board.peripheral.swclkPin.$suggestSolution   = "PA20";
+Board.peripheral.swdioPin.$suggestSolution   = "PA19";

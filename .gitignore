@@ -1,0 +1,21 @@
+# 构建输出目录和中间文件不提交到 GitHub。
+keil/Objects/
+keil/*.map
+keil/*.uvguix.*
+iar/Debug/
+gcc/*.obj
+gcc/*.out
+gcc/*.map
+gcc/*.opt
+ticlang/*.obj
+ticlang/*.out
+ticlang/*.map
+ticlang/*.opt
+tests/*.exe
+
+# 常见编辑器和系统临时文件。
+.vscode/
+.idea/
+*.user
+*.tmp
+Thumbs.db
