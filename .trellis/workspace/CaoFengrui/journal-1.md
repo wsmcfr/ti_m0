@@ -83,3 +83,44 @@ Completed Trellis bootstrap for the MSPM0G3507 firmware project: filled backend 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: 集成电机循迹OLED按键底层模块
+
+**Date**: 2026-05-29
+**Task**: 集成电机循迹OLED按键底层模块
+**Branch**: `main`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| 项目 | 记录 |
+|---|---|
+| 本次工作 | 添加电机串口驱动与应用、灰度循迹驱动与算法、SSD1306 OLED 驱动与状态显示、按键驱动与消抖事件，并接入调度器 |
+| 硬件配置 | 更新 `empty.syscfg` 和 `ti_msp_dl_config.c/h`，新增 UART3 电机、I2C1 OLED、ADC0+DMA_CH6 灰度采样、灰度地址 GPIO、按键 GPIO |
+| 构建工程 | 同步 `gcc/makefile`、`ticlang/makefile`、`iar/makefile`、Keil `.uvprojx/.uvoptx` 文件列表 |
+| 测试证据 | `motor_protocol_test: all tests passed`；`gray_sensor_logic_test: all tests passed`；用户提供 Keil ARMCLANG 构建结果 `.axf` 为 `0 Error(s), 0 Warning(s)` |
+| 未验证项 | 本次没有做板上验证；OLED 亮屏、按键触发、灰度 8 路采样、电机 UART3 实机收发仍需上板确认 |
+| 备注 | 根目录未跟踪的 `device.opt`、`device.lds.genlibs`、`device_linker.lds` 是 SysConfig 临时生成产物，未纳入代码提交 |
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ccaaf0e` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
