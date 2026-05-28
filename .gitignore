@@ -13,6 +13,10 @@ ticlang/*.map
 ticlang/*.opt
 tests/*.exe
 
+# PCB 本地导出文件和外部电机资料不提交到 GitHub。
+Gerber_PCB1_2026-05-28.zip
+电机/
+
 # 常见编辑器和系统临时文件。
 .vscode/
 .idea/
