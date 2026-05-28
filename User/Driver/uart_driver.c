@@ -1,8 +1,8 @@
 /**
  * @file    uart_driver.c
- * @brief   MSPM0G3507 UART0/UART1 DMA + 空闲中断驱动实现。
+ * @brief   MSPM0G3507 UART0/UART1/UART3 DMA + 空闲中断驱动实现。
  *
- * @details 两路串口都使用 RX DMA 持续搬运数据。UART 接收超时中断
+ * @details 各路串口都使用 RX DMA 持续搬运数据。UART 接收超时中断
  *          DL_UART_MAIN_IIDX_RX_TIMEOUT_ERROR 被当作“空闲中断”使用：
  *          当一段数据结束后，驱动停止当前 RX DMA，计算已经接收的字节数，
  *          复制到 ready 缓冲区给 App 层读取，然后立即重启 RX DMA。
@@ -47,20 +47,26 @@ typedef struct
     volatile uint32_t tx_timeout_count;            /* TX 等待超时计数。 */
 } uart_driver_context_t;
 
-/* 两路串口的硬件资源表，和 empty.syscfg 里的 UART_PC/UART_GYRO、DMA 通道保持一致。 */
+/* 三路串口的硬件资源表，和 empty.syscfg 里的 UART_PC/UART_GYRO/UART_MOTOR、DMA 通道保持一致。 */
 static uart_driver_context_t s_uart_contexts[UART_DRIVER_PORT_COUNT] =
 {
     {
-        UART_PC_INST,
-        UART_PC_INST_INT_IRQN,
-        DMA_PC_RX_CHAN_ID,
-        DMA_PC_TX_CHAN_ID,
+        .uart = UART_PC_INST,
+        .irqn = UART_PC_INST_INT_IRQN,
+        .rx_dma_chan = DMA_PC_RX_CHAN_ID,
+        .tx_dma_chan = DMA_PC_TX_CHAN_ID,
     },
     {
-        UART_GYRO_INST,
-        UART_GYRO_INST_INT_IRQN,
-        DMA_GYRO_RX_CHAN_ID,
-        DMA_GYRO_TX_CHAN_ID,
+        .uart = UART_GYRO_INST,
+        .irqn = UART_GYRO_INST_INT_IRQN,
+        .rx_dma_chan = DMA_GYRO_RX_CHAN_ID,
+        .tx_dma_chan = DMA_GYRO_TX_CHAN_ID,
+    },
+    {
+        .uart = UART_MOTOR_INST,
+        .irqn = UART_MOTOR_INST_INT_IRQN,
+        .rx_dma_chan = DMA_MOTOR_RX_CHAN_ID,
+        .tx_dma_chan = DMA_MOTOR_TX_CHAN_ID,
     },
 };
 
@@ -319,7 +325,7 @@ static void Uart_DriverHandleIrq(uart_driver_context_t *ctx)
  * @brief  初始化 UART DMA 驱动。
  *
  * @note   SYSCFG_DL_init() 已经完成 UART、GPIO、DMA 通道基础配置。
- *         本函数只补充 DMA 源/目的地址、启动 RX DMA，并打开两路 UART NVIC 中断。
+ *         本函数只补充 DMA 源/目的地址、启动 RX DMA，并打开各路 UART NVIC 中断。
  *
  * @param  无。
  * @return 无。
@@ -698,4 +704,18 @@ void UART_GYRO_INST_IRQHandler(void)
 {
     /* 将 UART1/GYRO 的中断交给统一处理函数，传入陀螺仪端口上下文。 */
     Uart_DriverHandleIrq(&s_uart_contexts[UART_DRIVER_PORT_GYRO]);
+}
+
+/**
+ * @brief  UART3 中断服务函数。
+ *
+ * @note   UART3 在本工程中命名为 UART_MOTOR，用于连接电机驱动板。
+ *
+ * @param  无。
+ * @return 无。
+ */
+void UART_MOTOR_INST_IRQHandler(void)
+{
+    /* 将 UART3/MOTOR 的中断交给统一处理函数，传入电机端口上下文。 */
+    Uart_DriverHandleIrq(&s_uart_contexts[UART_DRIVER_PORT_MOTOR]);
 }

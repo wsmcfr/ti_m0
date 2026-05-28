@@ -1,6 +1,6 @@
 /**
  * @file    uart_app.h
- * @brief   UART 应用层接口，封装电脑串口打印和陀螺仪串口收发。
+ * @brief   UART 应用层接口，封装电脑、陀螺仪和电机驱动板串口收发。
  */
 
 #ifndef UART_APP_H
@@ -22,8 +22,10 @@ void Uart_AppInit(void);
 void Uart_AppTask(void);
 bool Uart_AppSendToPc(const uint8_t *data, uint16_t length);
 bool Uart_AppSendToGyro(const uint8_t *data, uint16_t length);
+bool Uart_AppSendToMotor(const uint8_t *data, uint16_t length);
 uint16_t Uart_AppReadPcPacket(uint8_t *out_data, uint16_t max_length);
 uint16_t Uart_AppReadGyroPacket(uint8_t *out_data, uint16_t max_length);
+uint16_t Uart_AppReadMotorPacket(uint8_t *out_data, uint16_t max_length);
 void Uart_AppGetStats(uart_driver_port_t port, uart_driver_stats_t *out_stats);
 int my_printf(const char *format, ...);
 

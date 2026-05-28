@@ -18,8 +18,16 @@ USER_C_FILES = ../User/scheduler.c \
     ../User/App/uart_app.c \
     ../User/App/gyro_protocol.c \
     ../User/App/gyro_app.c \
+    ../User/App/motor_protocol.c \
+    ../User/App/motor_app.c \
+    ../User/App/line_track_app.c \
+    ../User/App/oled_app.c \
+    ../User/App/key_app.c \
     ../User/Driver/led_driver.c \
-    ../User/Driver/uart_driver.c
+    ../User/Driver/uart_driver.c \
+    ../User/Driver/gray_sensor_driver.c \
+    ../User/Driver/oled_driver.c \
+    ../User/Driver/key_driver.c
 
 OBJECTS = empty.obj \
     scheduler.obj \
@@ -27,8 +35,16 @@ OBJECTS = empty.obj \
     uart_app.obj \
     gyro_protocol.obj \
     gyro_app.obj \
+    motor_protocol.obj \
+    motor_app.obj \
+    line_track_app.obj \
+    oled_app.obj \
+    key_app.obj \
     led_driver.obj \
     uart_driver.obj \
+    gray_sensor_driver.obj \
+    oled_driver.obj \
+    key_driver.obj \
     iar_startup_mspm0g350x_iar.obj \
     $(patsubst %.c,%.obj,$(notdir $(SYSCFG_C_FILES)))
 NAME = M0G3507_Project

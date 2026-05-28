@@ -469,6 +469,56 @@
               <FileType>5</FileType>
               <FilePath>../User/App/gyro_app.h</FilePath>
             </File>
+            <File>
+              <FileName>motor_protocol.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/App/motor_protocol.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_protocol.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../User/App/motor_protocol.h</FilePath>
+            </File>
+            <File>
+              <FileName>motor_app.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/App/motor_app.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_app.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../User/App/motor_app.h</FilePath>
+            </File>
+            <File>
+              <FileName>line_track_app.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/App/line_track_app.c</FilePath>
+            </File>
+            <File>
+              <FileName>line_track_app.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../User/App/line_track_app.h</FilePath>
+            </File>
+            <File>
+              <FileName>oled_app.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/App/oled_app.c</FilePath>
+            </File>
+            <File>
+              <FileName>oled_app.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../User/App/oled_app.h</FilePath>
+            </File>
+            <File>
+              <FileName>key_app.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/App/key_app.c</FilePath>
+            </File>
+            <File>
+              <FileName>key_app.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../User/App/key_app.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -493,6 +543,36 @@
               <FileName>uart_driver.h</FileName>
               <FileType>5</FileType>
               <FilePath>../User/Driver/uart_driver.h</FilePath>
+            </File>
+            <File>
+              <FileName>gray_sensor_driver.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/Driver/gray_sensor_driver.c</FilePath>
+            </File>
+            <File>
+              <FileName>gray_sensor_driver.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../User/Driver/gray_sensor_driver.h</FilePath>
+            </File>
+            <File>
+              <FileName>oled_driver.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/Driver/oled_driver.c</FilePath>
+            </File>
+            <File>
+              <FileName>oled_driver.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../User/Driver/oled_driver.h</FilePath>
+            </File>
+            <File>
+              <FileName>key_driver.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/Driver/key_driver.c</FilePath>
+            </File>
+            <File>
+              <FileName>key_driver.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../User/Driver/key_driver.h</FilePath>
             </File>
           </Files>
         </Group>

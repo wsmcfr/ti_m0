@@ -1,0 +1,48 @@
+/**
+ * @file    motor_app.h
+ * @brief   电机驱动板应用层接口，封装 Modbus RTU 命令发送和编码器缓存。
+ */
+
+#ifndef MOTOR_APP_H
+#define MOTOR_APP_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "motor_protocol.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief  电机应用层保存的最新运行状态。
+ *
+ * @note   desired_speed 是最近一次成功请求发送的目标速度；
+ *         encoder 是最近一次从电机驱动板返回帧解析出的编码器值。
+ */
+typedef struct
+{
+    int16_t desired_speed[MOTOR_PROTOCOL_MOTOR_COUNT]; /* 四路目标速度，按 A/B/C/D 顺序保存。 */
+    int16_t encoder[MOTOR_PROTOCOL_MOTOR_COUNT];       /* 四路编码器最新值，按 A/B/C/D 顺序保存。 */
+    bool encoder_valid[MOTOR_PROTOCOL_MOTOR_COUNT];    /* true 表示对应编码器值已经解析过。 */
+    uint32_t tx_count;                                 /* 成功发送的电机命令帧数量。 */
+    uint32_t rx_count;                                 /* 成功解析的电机返回帧数量。 */
+    uint32_t crc_error_count;                          /* 收到但 CRC 或格式错误的返回帧数量。 */
+    uint32_t last_rx_ms;                               /* 最近一次成功解析返回帧的系统 tick。 */
+} motor_app_status_t;
+
+void Motor_AppInit(void);
+void Motor_AppTask(void);
+bool Motor_AppEnableClosedLoop(void);
+bool Motor_AppSetSpeeds(const int16_t speeds[MOTOR_PROTOCOL_MOTOR_COUNT]);
+bool Motor_AppSetSpeed4(int16_t motor_a, int16_t motor_b, int16_t motor_c, int16_t motor_d);
+bool Motor_AppSetPid(const motor_protocol_pid_t pid[MOTOR_PROTOCOL_MOTOR_COUNT]);
+bool Motor_AppRequestEncoder(uint8_t motor_index);
+bool Motor_AppGetStatus(motor_app_status_t *out_status);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* MOTOR_APP_H */

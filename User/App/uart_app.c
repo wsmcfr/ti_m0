@@ -1,9 +1,10 @@
 /**
  * @file    uart_app.c
- * @brief   UART 应用层实现，提供 printf 重定向和两路串口的业务级收发接口。
+ * @brief   UART 应用层实现，提供 printf 重定向和多路串口的业务级收发接口。
  *
  * @details UART0 连接电脑，主要用于日志和上位机输出；
- *          UART1 连接陀螺仪，主要用于接收姿态数据和发送配置命令。
+ *          UART1 连接陀螺仪，主要用于接收姿态数据和发送配置命令；
+ *          UART3 连接电机驱动板，主要用于发送 Modbus RTU 命令和接收编码器返回帧。
  */
 
 #include "uart_app.h"
@@ -17,7 +18,7 @@ static uint8_t s_pc_rx_discard_buffer[UART_DRIVER_RX_DMA_BUFFER_SIZE];
 /**
  * @brief  初始化 UART 应用层。
  *
- * @note   这里调用 Driver 层启动两路 UART RX DMA，并输出一条启动日志。
+ * @note   这里调用 Driver 层启动各路 UART RX DMA，并输出一条启动日志。
  *         启动日志使用 DMA 批量发送，如果电脑端未连接不会影响 MCU 后续运行。
  *
  * @param  无。
@@ -25,10 +26,10 @@ static uint8_t s_pc_rx_discard_buffer[UART_DRIVER_RX_DMA_BUFFER_SIZE];
  */
 void Uart_AppInit(void)
 {
-    /* 初始化 UART 驱动层，启动两路 UART 的 DMA 接收和中断处理。 */
+    /* 初始化 UART 驱动层，启动各路 UART 的 DMA 接收和中断处理。 */
     Uart_DriverInit();
     /* 输出启动日志；强制转 void 是因为这里只做提示，不让日志失败影响启动流程。 */
-    (void)my_printf("\r\n[UART] UART0=PC DMA ready, UART1=GYRO DMA ready\r\n");
+    (void)my_printf("\r\n[UART] UART0=PC, UART1=GYRO, UART3=MOTOR DMA ready\r\n");
 }
 
 /**
@@ -78,6 +79,21 @@ bool Uart_AppSendToGyro(const uint8_t *data, uint16_t length)
 }
 
 /**
+ * @brief  通过电机串口 UART3 发送一段数据。
+ *
+ * @note   电机驱动板使用 Modbus RTU 帧，本接口只负责字节发送，不解释协议含义。
+ *
+ * @param  data   待发送数据地址。
+ * @param  length 待发送字节数。
+ * @return true 表示发送完成；false 表示参数错误或发送超时。
+ */
+bool Uart_AppSendToMotor(const uint8_t *data, uint16_t length)
+{
+    /* 把电机串口发送请求转交给驱动层 UART3/MOTOR 端口。 */
+    return Uart_DriverWrite(UART_DRIVER_PORT_MOTOR, data, length);
+}
+
+/**
  * @brief  读取电脑串口 UART0 的一包接收数据。
  *
  * @note   “一包”由 UART RX_TIMEOUT 空闲中断或 DMA 满缓冲切分。
@@ -106,6 +122,22 @@ uint16_t Uart_AppReadGyroPacket(uint8_t *out_data, uint16_t max_length)
 {
     /* 从驱动层读取陀螺仪串口的一包数据，并返回实际复制长度。 */
     return Uart_DriverReadPacket(UART_DRIVER_PORT_GYRO, out_data, max_length);
+}
+
+/**
+ * @brief  读取电机串口 UART3 的一包接收数据。
+ *
+ * @note   “一包”由 UART RX_TIMEOUT 空闲中断或 DMA 满缓冲切分。
+ *         App 层需要按 Modbus RTU 协议校验 CRC 后再使用数据。
+ *
+ * @param  out_data   输出缓冲。
+ * @param  max_length 输出缓冲最大长度。
+ * @return 实际读取字节数；0 表示暂无数据。
+ */
+uint16_t Uart_AppReadMotorPacket(uint8_t *out_data, uint16_t max_length)
+{
+    /* 从驱动层读取电机串口的一包数据，并返回实际复制长度。 */
+    return Uart_DriverReadPacket(UART_DRIVER_PORT_MOTOR, out_data, max_length);
 }
 
 /**

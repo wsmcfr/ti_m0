@@ -1,8 +1,8 @@
 /**
  * @file    uart_driver.h
- * @brief   MSPM0G3507 双串口 DMA 驱动层接口。
+ * @brief   MSPM0G3507 多串口 DMA 驱动层接口。
  *
- * @details 本驱动只负责 UART0/UART1 的硬件收发、DMA 缓冲和中断事件归集。
+ * @details 本驱动只负责 UART0/UART1/UART3 的硬件收发、DMA 缓冲和中断事件归集。
  *          上层不直接访问 UART 寄存器，而是通过本文件读取一包空闲中断切分后的数据。
  */
 
@@ -23,12 +23,14 @@ extern "C" {
 /**
  * @brief  工程中使用的串口逻辑编号。
  *
- * @note   PC 串口用于连接电脑串口助手/上位机，GYRO 串口用于连接陀螺仪模块。
+ * @note   PC 串口用于连接电脑串口助手/上位机，GYRO 串口用于连接陀螺仪模块，
+ *         MOTOR 串口用于连接电机驱动板。
  */
 typedef enum
 {
     UART_DRIVER_PORT_PC = 0,     /* UART0，PA10=TX，PA11=RX，对接电脑。 */
     UART_DRIVER_PORT_GYRO,       /* UART1，PA8=TX，PA9=RX，对接陀螺仪。 */
+    UART_DRIVER_PORT_MOTOR,      /* UART3，PB2=TX，PB3=RX，对接电机驱动板。 */
     UART_DRIVER_PORT_COUNT       /* 串口数量，只用于数组长度检查。 */
 } uart_driver_port_t;
 

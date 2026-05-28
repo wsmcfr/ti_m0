@@ -8,7 +8,11 @@
 #include <stddef.h>
 
 #include "gyro_app.h"
+#include "key_app.h"
 #include "led_app.h"
+#include "line_track_app.h"
+#include "motor_app.h"
+#include "oled_app.h"
 #include "uart_app.h"
 
 /* 调度器依赖的全局毫秒 tick，由 SysTick_Handler() 调用 Scheduler_TickInc() 递增。 */
@@ -21,8 +25,12 @@ static uint8_t Task_Num = 0U;
 static task_t Scheduler_Task[] =
 {
     { Led_AppTask, 100U, 0U },
+    { Key_AppTask, 5U, 0U },
     { Uart_AppTask, 20U, 0U },
     { Gyro_AppTask, 5U, 0U },
+    { LineTrack_AppTask, 20U, 0U },
+    { Motor_AppTask, 5U, 0U },
+    { Oled_AppTask, 20U, 0U },
 };
 
 /**
@@ -128,10 +136,18 @@ void System_Init(void)
 {
     /* 初始化 LED 应用层及其底层 GPIO 状态。 */
     Led_AppInit();
-    /* 初始化 UART 应用层及两路 UART DMA 收发驱动。 */
+    /* 初始化 UART 应用层及三路 UART DMA 收发驱动。 */
     Uart_AppInit();
     /* 初始化陀螺仪应用层和协议解析器状态。 */
     Gyro_AppInit();
+    /* 初始化按键应用层，建立消抖起始状态。 */
+    Key_AppInit();
+    /* 初始化灰度循迹应用层，启动灰度底层驱动和校准状态。 */
+    LineTrack_AppInit();
+    /* 初始化电机应用层，清空目标速度、编码器和协议统计。 */
+    Motor_AppInit();
+    /* 初始化 OLED 应用层，后续低频刷新系统状态。 */
+    Oled_AppInit();
     /* 最后初始化调度器时间基准，让任务从当前 tick 开始计周期。 */
     Scheduler_Init();
 }

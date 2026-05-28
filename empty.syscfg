@@ -11,11 +11,18 @@
  */
 const GPIO    = scripting.addModule("/ti/driverlib/GPIO", {}, false);
 const GPIO1   = GPIO.addInstance();
+const GPIO_GRAY_ADDR = GPIO.addInstance();
+const GPIO_KEY = GPIO.addInstance();
+const ADC12   = scripting.addModule("/ti/driverlib/ADC12", {}, false);
+const ADC_GRAY = ADC12.addInstance();
+const I2C     = scripting.addModule("/ti/driverlib/I2C", {}, false);
+const I2C_OLED = I2C.addInstance();
 const SYSCTL  = scripting.addModule("/ti/driverlib/SYSCTL");
 const SYSTICK = scripting.addModule("/ti/driverlib/SYSTICK");
 const UART    = scripting.addModule("/ti/driverlib/UART", {}, false);
 const UART_PC = UART.addInstance();
 const UART_GYRO = UART.addInstance();
+const UART_MOTOR = UART.addInstance();
 
 /**
  * Write custom configuration values to the imported modules.
@@ -26,6 +33,74 @@ GPIO1.associatedPins[0].$name       = "LED_BLUE";
 GPIO1.associatedPins[0].assignedPin = "22";
 
 const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
+
+GPIO_GRAY_ADDR.$name                          = "GRAY_ADDR_PORT";
+GPIO_GRAY_ADDR.port                           = "PORTA";
+GPIO_GRAY_ADDR.associatedPins.create(3);
+GPIO_GRAY_ADDR.associatedPins[0].$name        = "GRAY_AD0";
+GPIO_GRAY_ADDR.associatedPins[0].assignedPin  = "15";
+GPIO_GRAY_ADDR.associatedPins[0].initialValue = "CLEARED";
+GPIO_GRAY_ADDR.associatedPins[1].$name        = "GRAY_AD1";
+GPIO_GRAY_ADDR.associatedPins[1].assignedPin  = "14";
+GPIO_GRAY_ADDR.associatedPins[1].initialValue = "CLEARED";
+GPIO_GRAY_ADDR.associatedPins[2].$name        = "GRAY_AD2";
+GPIO_GRAY_ADDR.associatedPins[2].assignedPin  = "13";
+GPIO_GRAY_ADDR.associatedPins[2].initialValue = "CLEARED";
+
+GPIO_KEY.$name                              = "KEY_PORT";
+GPIO_KEY.associatedPins.create(4);
+GPIO_KEY.associatedPins[0].$name            = "KEY_K1";
+GPIO_KEY.associatedPins[0].direction        = "INPUT";
+GPIO_KEY.associatedPins[0].internalResistor = "PULL_UP";
+GPIO_KEY.associatedPins[0].assignedPort     = "PORTA";
+GPIO_KEY.associatedPins[0].assignedPin      = "7";
+GPIO_KEY.associatedPins[1].$name            = "KEY_K2";
+GPIO_KEY.associatedPins[1].direction        = "INPUT";
+GPIO_KEY.associatedPins[1].internalResistor = "PULL_UP";
+GPIO_KEY.associatedPins[1].assignedPort     = "PORTB";
+GPIO_KEY.associatedPins[1].assignedPin      = "10";
+GPIO_KEY.associatedPins[2].$name            = "KEY_K3";
+GPIO_KEY.associatedPins[2].direction        = "INPUT";
+GPIO_KEY.associatedPins[2].internalResistor = "PULL_UP";
+GPIO_KEY.associatedPins[2].assignedPort     = "PORTB";
+GPIO_KEY.associatedPins[2].assignedPin      = "11";
+GPIO_KEY.associatedPins[3].$name            = "KEY_K4";
+GPIO_KEY.associatedPins[3].direction        = "INPUT";
+GPIO_KEY.associatedPins[3].internalResistor = "PULL_UP";
+GPIO_KEY.associatedPins[3].assignedPort     = "PORTB";
+GPIO_KEY.associatedPins[3].assignedPin      = "14";
+
+ADC_GRAY.$name                              = "ADC_GRAY";
+ADC_GRAY.sampClkSrc                         = "DL_ADC12_CLOCK_ULPCLK";
+ADC_GRAY.sampClkDiv                         = "DL_ADC12_CLOCK_DIVIDE_8";
+ADC_GRAY.sampleTime0                        = "40 us";
+ADC_GRAY.powerDownMode                      = "DL_ADC12_POWER_DOWN_MODE_MANUAL";
+ADC_GRAY.configureDMA                       = true;
+ADC_GRAY.enableFIFO                         = true;
+ADC_GRAY.sampCnt                            = 1;
+ADC_GRAY.enabledDMATriggers                 = ["DL_ADC12_DMA_MEM0_RESULT_LOADED"];
+ADC_GRAY.enabledInterrupts                  = ["DL_ADC12_INTERRUPT_DMA_DONE"];
+ADC_GRAY.adcMem0chansel                     = "DL_ADC12_INPUT_CHAN_0";
+ADC_GRAY.peripheral.$assign                 = "ADC0";
+ADC_GRAY.peripheral.adcPin0.$assign         = "PA27";
+ADC_GRAY.DMA_CHANNEL.$name                  = "DMA_GRAY";
+ADC_GRAY.DMA_CHANNEL.addressMode            = "f2b";
+ADC_GRAY.DMA_CHANNEL.srcLength              = "HALF_WORD";
+ADC_GRAY.DMA_CHANNEL.dstLength              = "HALF_WORD";
+ADC_GRAY.DMA_CHANNEL.peripheral.$assign     = "DMA_CH6";
+
+I2C_OLED.$name                              = "I2C_OLED";
+I2C_OLED.basicControllerBusSpeed            = 400000;
+I2C_OLED.advControllerTXFIFOTRIG            = "BYTES_1";
+I2C_OLED.advControllerRXFIFOTRIG            = "BYTES_1";
+I2C_OLED.advAnalogGlitchFilter              = "DISABLED";
+I2C_OLED.peripheral.$assign                 = "I2C1";
+I2C_OLED.peripheral.sclPin.$assign          = "PA29";
+I2C_OLED.peripheral.sdaPin.$assign          = "PA30";
+I2C_OLED.sclPinConfig.enableConfig          = true;
+I2C_OLED.sclPinConfig.internalResistor      = "PULL_UP";
+I2C_OLED.sdaPinConfig.enableConfig          = true;
+I2C_OLED.sdaPinConfig.internalResistor      = "PULL_UP";
 
 SYSCTL.forceDefaultClkConfig = true;
 SYSCTL.clockTreeEn           = true;
@@ -102,12 +177,52 @@ UART_GYRO.DMA_CHANNEL_TX.dstLength         = "BYTE";
 UART_GYRO.DMA_CHANNEL_TX.srcIncrement      = "INCREMENT";
 UART_GYRO.DMA_CHANNEL_TX.peripheral.$assign = "DMA_CH3";
 
+UART_MOTOR.$name                              = "UART_MOTOR";
+UART_MOTOR.targetBaudRate                     = 115200;
+UART_MOTOR.enableFIFO                         = true;
+UART_MOTOR.rxFifoThreshold                    = "DL_UART_RX_FIFO_LEVEL_ONE_ENTRY";
+UART_MOTOR.txFifoThreshold                    = "DL_UART_TX_FIFO_LEVEL_ONE_ENTRY";
+UART_MOTOR.rxTimeoutValue                     = 15;
+UART_MOTOR.enabledInterrupts                  = ["DMA_DONE_RX","DMA_DONE_TX","EOT_DONE","RX_TIMEOUT_ERROR"];
+UART_MOTOR.enabledDMARXTriggers               = "DL_UART_DMA_INTERRUPT_RX";
+UART_MOTOR.enabledDMATXTriggers               = "DL_UART_DMA_INTERRUPT_TX";
+UART_MOTOR.enableDMARX                        = true;
+UART_MOTOR.enableDMATX                        = true;
+UART_MOTOR.peripheral.$assign                 = "UART3";
+UART_MOTOR.peripheral.rxPin.$assign           = "PB3";
+UART_MOTOR.peripheral.txPin.$assign           = "PB2";
+UART_MOTOR.rxPinConfig.enableConfig           = true;
+UART_MOTOR.rxPinConfig.internalResistor       = "PULL_UP";
+UART_MOTOR.txPinConfig.enableConfig           = true;
+UART_MOTOR.txPinConfig.internalResistor       = "PULL_UP";
+UART_MOTOR.DMA_CHANNEL_RX.$name               = "DMA_MOTOR_RX";
+UART_MOTOR.DMA_CHANNEL_RX.addressMode         = "f2b";
+UART_MOTOR.DMA_CHANNEL_RX.srcLength           = "BYTE";
+UART_MOTOR.DMA_CHANNEL_RX.dstLength           = "BYTE";
+UART_MOTOR.DMA_CHANNEL_RX.configureTransferSize = true;
+UART_MOTOR.DMA_CHANNEL_RX.transferSize        = 128;
+UART_MOTOR.DMA_CHANNEL_RX.destIncrement       = "INCREMENT";
+UART_MOTOR.DMA_CHANNEL_RX.peripheral.$assign  = "DMA_CH4";
+UART_MOTOR.DMA_CHANNEL_TX.$name               = "DMA_MOTOR_TX";
+UART_MOTOR.DMA_CHANNEL_TX.addressMode         = "b2f";
+UART_MOTOR.DMA_CHANNEL_TX.srcLength           = "BYTE";
+UART_MOTOR.DMA_CHANNEL_TX.dstLength           = "BYTE";
+UART_MOTOR.DMA_CHANNEL_TX.srcIncrement        = "INCREMENT";
+UART_MOTOR.DMA_CHANNEL_TX.peripheral.$assign  = "DMA_CH5";
+
 /**
  * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
  * version of the tool will not impact the pinmux you originally saw.  These lines can be completely deleted in order to
  * re-solve from scratch.
  */
 GPIO1.associatedPins[0].pin.$suggestSolution = "PB22";
+GPIO_GRAY_ADDR.associatedPins[0].pin.$suggestSolution = "PA15";
+GPIO_GRAY_ADDR.associatedPins[1].pin.$suggestSolution = "PA14";
+GPIO_GRAY_ADDR.associatedPins[2].pin.$suggestSolution = "PA13";
+GPIO_KEY.associatedPins[0].pin.$suggestSolution       = "PA7";
+GPIO_KEY.associatedPins[1].pin.$suggestSolution       = "PB10";
+GPIO_KEY.associatedPins[2].pin.$suggestSolution       = "PB11";
+GPIO_KEY.associatedPins[3].pin.$suggestSolution       = "PB14";
 Board.peripheral.$suggestSolution            = "DEBUGSS";
 Board.peripheral.swclkPin.$suggestSolution   = "PA20";
 Board.peripheral.swdioPin.$suggestSolution   = "PA19";

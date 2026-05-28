@@ -78,6 +78,21 @@ extern "C" {
 
 
 
+
+/* Defines for I2C_OLED */
+#define I2C_OLED_INST                                                       I2C1
+#define I2C_OLED_INST_IRQHandler                                 I2C1_IRQHandler
+#define I2C_OLED_INST_INT_IRQN                                     I2C1_INT_IRQn
+#define GPIO_I2C_OLED_SDA_PORT                                             GPIOA
+#define GPIO_I2C_OLED_SDA_PIN                                     DL_GPIO_PIN_30
+#define GPIO_I2C_OLED_IOMUX_SDA                                   (IOMUX_PINCM5)
+#define GPIO_I2C_OLED_IOMUX_SDA_FUNC                    IOMUX_PINCM5_PF_I2C1_SDA
+#define GPIO_I2C_OLED_SCL_PORT                                             GPIOA
+#define GPIO_I2C_OLED_SCL_PIN                                     DL_GPIO_PIN_29
+#define GPIO_I2C_OLED_IOMUX_SCL                                   (IOMUX_PINCM4)
+#define GPIO_I2C_OLED_IOMUX_SCL_FUNC                    IOMUX_PINCM4_PF_I2C1_SCL
+
+
 /* Defines for UART_PC */
 #define UART_PC_INST                                                       UART0
 #define UART_PC_INST_FREQUENCY                                          32000000
@@ -110,11 +125,42 @@ extern "C" {
 #define UART_GYRO_BAUD_RATE                                             (115200)
 #define UART_GYRO_IBRD_32_MHZ_115200_BAUD                                   (17)
 #define UART_GYRO_FBRD_32_MHZ_115200_BAUD                                   (23)
+/* Defines for UART_MOTOR */
+#define UART_MOTOR_INST                                                    UART3
+#define UART_MOTOR_INST_FREQUENCY                                       32000000
+#define UART_MOTOR_INST_IRQHandler                              UART3_IRQHandler
+#define UART_MOTOR_INST_INT_IRQN                                  UART3_INT_IRQn
+#define GPIO_UART_MOTOR_RX_PORT                                            GPIOB
+#define GPIO_UART_MOTOR_TX_PORT                                            GPIOB
+#define GPIO_UART_MOTOR_RX_PIN                                     DL_GPIO_PIN_3
+#define GPIO_UART_MOTOR_TX_PIN                                     DL_GPIO_PIN_2
+#define GPIO_UART_MOTOR_IOMUX_RX                                 (IOMUX_PINCM16)
+#define GPIO_UART_MOTOR_IOMUX_TX                                 (IOMUX_PINCM15)
+#define GPIO_UART_MOTOR_IOMUX_RX_FUNC                  IOMUX_PINCM16_PF_UART3_RX
+#define GPIO_UART_MOTOR_IOMUX_TX_FUNC                  IOMUX_PINCM15_PF_UART3_TX
+#define UART_MOTOR_BAUD_RATE                                            (115200)
+#define UART_MOTOR_IBRD_32_MHZ_115200_BAUD                                  (17)
+#define UART_MOTOR_FBRD_32_MHZ_115200_BAUD                                  (23)
 
 
 
 
 
+/* Defines for ADC_GRAY */
+#define ADC_GRAY_INST                                                       ADC0
+#define ADC_GRAY_INST_IRQHandler                                 ADC0_IRQHandler
+#define ADC_GRAY_INST_INT_IRQN                                   (ADC0_INT_IRQn)
+#define ADC_GRAY_ADCMEM_0                                     DL_ADC12_MEM_IDX_0
+#define ADC_GRAY_ADCMEM_0_REF                    DL_ADC12_REFERENCE_VOLTAGE_VDDA
+#define ADC_GRAY_ADCMEM_0_REF_VOLTAGE_V                                      3.3
+#define GPIO_ADC_GRAY_C0_PORT                                              GPIOA
+#define GPIO_ADC_GRAY_C0_PIN                                      DL_GPIO_PIN_27
+
+
+
+/* Defines for DMA_GRAY */
+#define DMA_GRAY_CHAN_ID                                                     (6)
+#define ADC_GRAY_INST_DMA_TRIGGER                     (DMA_ADC0_EVT_GEN_BD_TRIG)
 /* Defines for DMA_PC_RX */
 #define DMA_PC_RX_CHAN_ID                                                    (0)
 #define UART_PC_INST_DMA_TRIGGER_0                           (DMA_UART0_RX_TRIG)
@@ -127,6 +173,12 @@ extern "C" {
 /* Defines for DMA_GYRO_TX */
 #define DMA_GYRO_TX_CHAN_ID                                                  (3)
 #define UART_GYRO_INST_DMA_TRIGGER_1                         (DMA_UART1_TX_TRIG)
+/* Defines for DMA_MOTOR_RX */
+#define DMA_MOTOR_RX_CHAN_ID                                                 (4)
+#define UART_MOTOR_INST_DMA_TRIGGER_0                        (DMA_UART3_RX_TRIG)
+/* Defines for DMA_MOTOR_TX */
+#define DMA_MOTOR_TX_CHAN_ID                                                 (5)
+#define UART_MOTOR_INST_DMA_TRIGGER_1                        (DMA_UART3_TX_TRIG)
 
 
 /* Port definition for Pin Group LED_PORT */
@@ -135,6 +187,34 @@ extern "C" {
 /* Defines for LED_BLUE: GPIOB.22 with pinCMx 50 on package pin 21 */
 #define LED_PORT_LED_BLUE_PIN                                   (DL_GPIO_PIN_22)
 #define LED_PORT_LED_BLUE_IOMUX                                  (IOMUX_PINCM50)
+/* Port definition for Pin Group GRAY_ADDR_PORT */
+#define GRAY_ADDR_PORT_PORT                                              (GPIOA)
+
+/* Defines for GRAY_AD0: GPIOA.15 with pinCMx 37 on package pin 8 */
+#define GRAY_ADDR_PORT_GRAY_AD0_PIN                             (DL_GPIO_PIN_15)
+#define GRAY_ADDR_PORT_GRAY_AD0_IOMUX                            (IOMUX_PINCM37)
+/* Defines for GRAY_AD1: GPIOA.14 with pinCMx 36 on package pin 7 */
+#define GRAY_ADDR_PORT_GRAY_AD1_PIN                             (DL_GPIO_PIN_14)
+#define GRAY_ADDR_PORT_GRAY_AD1_IOMUX                            (IOMUX_PINCM36)
+/* Defines for GRAY_AD2: GPIOA.13 with pinCMx 35 on package pin 6 */
+#define GRAY_ADDR_PORT_GRAY_AD2_PIN                             (DL_GPIO_PIN_13)
+#define GRAY_ADDR_PORT_GRAY_AD2_IOMUX                            (IOMUX_PINCM35)
+/* Defines for KEY_K1: GPIOA.7 with pinCMx 14 on package pin 49 */
+#define KEY_PORT_KEY_K1_PORT                                             (GPIOA)
+#define KEY_PORT_KEY_K1_PIN                                      (DL_GPIO_PIN_7)
+#define KEY_PORT_KEY_K1_IOMUX                                    (IOMUX_PINCM14)
+/* Defines for KEY_K2: GPIOB.10 with pinCMx 27 on package pin 62 */
+#define KEY_PORT_KEY_K2_PORT                                             (GPIOB)
+#define KEY_PORT_KEY_K2_PIN                                     (DL_GPIO_PIN_10)
+#define KEY_PORT_KEY_K2_IOMUX                                    (IOMUX_PINCM27)
+/* Defines for KEY_K3: GPIOB.11 with pinCMx 28 on package pin 63 */
+#define KEY_PORT_KEY_K3_PORT                                             (GPIOB)
+#define KEY_PORT_KEY_K3_PIN                                     (DL_GPIO_PIN_11)
+#define KEY_PORT_KEY_K3_IOMUX                                    (IOMUX_PINCM28)
+/* Defines for KEY_K4: GPIOB.14 with pinCMx 31 on package pin 2 */
+#define KEY_PORT_KEY_K4_PORT                                             (GPIOB)
+#define KEY_PORT_KEY_K4_PIN                                     (DL_GPIO_PIN_14)
+#define KEY_PORT_KEY_K4_IOMUX                                    (IOMUX_PINCM31)
 
 
 
@@ -144,8 +224,11 @@ void SYSCFG_DL_init(void);
 void SYSCFG_DL_initPower(void);
 void SYSCFG_DL_GPIO_init(void);
 void SYSCFG_DL_SYSCTL_init(void);
+void SYSCFG_DL_I2C_OLED_init(void);
 void SYSCFG_DL_UART_PC_init(void);
 void SYSCFG_DL_UART_GYRO_init(void);
+void SYSCFG_DL_UART_MOTOR_init(void);
+void SYSCFG_DL_ADC_GRAY_init(void);
 void SYSCFG_DL_DMA_init(void);
 
 void SYSCFG_DL_SYSTICK_init(void);
