@@ -96,6 +96,14 @@ static void SchedulerTest_AdvanceToTick(uint32_t target_tick)
 }
 
 /**
+ * @brief  读取调度器本轮以来的任务表扫描次数。
+ *
+ * @param  无。
+ * @return 调度器内部累计扫描任务表项的次数。
+ */
+uint32_t Scheduler_GetScanCountForTest(void);
+
+/**
  * @brief  LED 桩任务。
  *
  * @param  无。
@@ -272,6 +280,42 @@ static void test_scheduler_staggers_low_priority_initial_deadlines(void)
 }
 
 /**
+ * @brief  验证无任务到期时调度器通过最早 deadline 快速返回，不扫描任务表。
+ *
+ * @param  无。
+ * @return 无。
+ */
+static void test_scheduler_skips_task_scan_before_next_deadline(void)
+{
+    bool has_task_run;
+    uint32_t scan_count_before;
+    uint32_t scan_count_after;
+
+    SchedulerTest_ResetStubs();
+    uwTick = 0U;
+    Scheduler_Init();
+
+    /* 初始化后第一个任务 deadline 是 1ms；0ms 调用应直接快速返回。 */
+    scan_count_before = Scheduler_GetScanCountForTest();
+    has_task_run = Scheduler_Run();
+    scan_count_after = Scheduler_GetScanCountForTest();
+
+    assert(has_task_run == false);
+    assert(s_call_count == 0U);
+    assert(scan_count_after == scan_count_before);
+
+    /* 到达 1ms 后需要扫描并运行灰度任务，证明快速路径不会漏掉到期任务。 */
+    uwTick = 1U;
+    has_task_run = Scheduler_Run();
+    scan_count_after = Scheduler_GetScanCountForTest();
+
+    assert(has_task_run == true);
+    assert(s_call_count >= 1U);
+    assert(scan_count_after > scan_count_before);
+    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
+}
+
+/**
  * @brief  验证 deadline 推进避免任务耗时造成周期基准漂移。
  *
  * @param  无。
@@ -280,7 +324,9 @@ static void test_scheduler_staggers_low_priority_initial_deadlines(void)
 static void test_scheduler_skips_backlog_after_overrun(void)
 {
     bool has_task_run;
+#if SCHEDULER_ENABLE_STATS
     scheduler_task_stats_t stats;
+#endif
 
     SchedulerTest_ResetStubs();
     uwTick = 0U;
@@ -306,12 +352,14 @@ static void test_scheduler_skips_backlog_after_overrun(void)
     assert(has_task_run == false);
     assert(s_call_count == 0U);
 
+#if SCHEDULER_ENABLE_STATS
     assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
     assert(stats.run_count == 1UL);
     assert(stats.overrun_count == 1UL);
     assert(stats.last_lateness_ms == 0UL);
     assert(stats.max_lateness_ms == 0UL);
     assert(stats.missed_deadline_count == 0UL);
+#endif
 }
 
 /**
@@ -340,10 +388,17 @@ static void test_scheduler_records_lateness_and_missed_periods(void)
     assert(s_call_count >= 1U);
     assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
     assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
+#if SCHEDULER_ENABLE_STATS
     assert(stats.run_count == 1UL);
     assert(stats.last_lateness_ms == 149UL);
     assert(stats.max_lateness_ms == 149UL);
     assert(stats.missed_deadline_count == 149UL);
+#else
+    assert(stats.run_count == 0UL);
+    assert(stats.last_lateness_ms == 0UL);
+    assert(stats.max_lateness_ms == 0UL);
+    assert(stats.missed_deadline_count == 0UL);
+#endif
 }
 
 /**
@@ -368,6 +423,7 @@ static void test_scheduler_records_runtime_and_overrun_stats(void)
 
     assert(has_task_run == true);
     assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
+#if SCHEDULER_ENABLE_STATS
     assert(stats.run_count == 1UL);
     assert(stats.max_runtime_ms == 3UL);
     assert(stats.last_runtime_ms == 3UL);
@@ -375,6 +431,15 @@ static void test_scheduler_records_runtime_and_overrun_stats(void)
     assert(stats.last_lateness_ms == 0UL);
     assert(stats.max_lateness_ms == 0UL);
     assert(stats.missed_deadline_count == 0UL);
+#else
+    assert(stats.run_count == 0UL);
+    assert(stats.max_runtime_ms == 0UL);
+    assert(stats.last_runtime_ms == 0UL);
+    assert(stats.overrun_count == 0UL);
+    assert(stats.last_lateness_ms == 0UL);
+    assert(stats.max_lateness_ms == 0UL);
+    assert(stats.missed_deadline_count == 0UL);
+#endif
 
     Scheduler_ClearTaskStats(SCHEDULER_TASK_ID_LINE_TRACK);
     assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
@@ -397,6 +462,7 @@ int main(void)
 {
     test_realtime_tasks_run_before_low_priority_tasks();
     test_scheduler_staggers_low_priority_initial_deadlines();
+    test_scheduler_skips_task_scan_before_next_deadline();
     test_scheduler_skips_backlog_after_overrun();
     test_scheduler_records_lateness_and_missed_periods();
     test_scheduler_records_runtime_and_overrun_stats();

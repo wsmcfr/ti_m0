@@ -21,6 +21,7 @@ volatile uint32_t uwTick = 0U;
 /* 任务表：按实时性从高到低排列，避免低优先级显示或心跳任务排在关键控制任务前面。 */
 static task_t Scheduler_Task[] =
 {
+#if SCHEDULER_ENABLE_STATS
     { SCHEDULER_TASK_ID_LINE_TRACK, LineTrack_AppTask, 1U, 0U, 0U, {0U} },
     { SCHEDULER_TASK_ID_GYRO, Gyro_AppTask, 5U, 0U, 0U, {0U} },
     { SCHEDULER_TASK_ID_MOTOR, Motor_AppTask, 5U, 0U, 0U, {0U} },
@@ -28,16 +29,36 @@ static task_t Scheduler_Task[] =
     { SCHEDULER_TASK_ID_UART, Uart_AppTask, 20U, 2U, 0U, {0U} },
     { SCHEDULER_TASK_ID_OLED, Oled_AppTask, 250U, 13U, 0U, {0U} },
     { SCHEDULER_TASK_ID_LED, Led_AppTask, 100U, 7U, 0U, {0U} },
+#else
+    { SCHEDULER_TASK_ID_LINE_TRACK, LineTrack_AppTask, 1U, 0U, 0U },
+    { SCHEDULER_TASK_ID_GYRO, Gyro_AppTask, 5U, 0U, 0U },
+    { SCHEDULER_TASK_ID_MOTOR, Motor_AppTask, 5U, 0U, 0U },
+    { SCHEDULER_TASK_ID_KEY, Key_AppTask, 5U, 0U, 0U },
+    { SCHEDULER_TASK_ID_UART, Uart_AppTask, 20U, 2U, 0U },
+    { SCHEDULER_TASK_ID_OLED, Oled_AppTask, 250U, 13U, 0U },
+    { SCHEDULER_TASK_ID_LED, Led_AppTask, 100U, 7U, 0U },
+#endif
 };
 
 /* 当前任务表中的任务数量由数组长度生成，编译期固定，避免运行期重复赋值。 */
 #define SCHEDULER_TASK_COUNT    ((uint8_t)(sizeof(Scheduler_Task) / sizeof(Scheduler_Task[0])))
 
+/* 当前所有任务中最早的下一次到期 tick，用于无任务到期时快速返回。 */
+static uint32_t s_scheduler_next_deadline_ms = 0U;
+
+#if defined(SCHEDULER_HOST_TEST)
+/* 主机测试专用扫描计数，生产固件不导出，避免增加运行期接口。 */
+static uint32_t s_scheduler_scan_count_for_test = 0U;
+#endif
+
 static task_t *Scheduler_FindTaskById(scheduler_task_id_t task_id);
 static bool Scheduler_IsDeadlineReached(uint32_t now_time, uint32_t deadline_ms);
+static void Scheduler_UpdateNextDeadline(void);
 static void Scheduler_UpdateTaskDeadline(task_t *task, uint32_t now_time);
+#if SCHEDULER_ENABLE_STATS
 static void Scheduler_RecordTaskLateness(task_t *task, uint32_t lateness_ms);
 static void Scheduler_RecordTaskRuntime(task_t *task, uint32_t start_time, uint32_t end_time);
+#endif
 
 /**
  * @brief  初始化调度器任务表的运行基准时间。
@@ -64,6 +85,7 @@ void Scheduler_Init(void)
         Scheduler_Task[i].deadline_ms = now_time +
             Scheduler_Task[i].interval_time_ms +
             Scheduler_Task[i].initial_offset_ms;
+#if SCHEDULER_ENABLE_STATS
         /* 初始化时清空统计，保证每次 System_Init() 后统计都从零开始。 */
         Scheduler_Task[i].stats.run_count = 0U;
         Scheduler_Task[i].stats.overrun_count = 0U;
@@ -73,7 +95,11 @@ void Scheduler_Init(void)
         Scheduler_Task[i].stats.max_lateness_ms = 0U;
         Scheduler_Task[i].stats.last_lateness_ms = 0U;
         Scheduler_Task[i].stats.last_start_ms = 0U;
+#endif
     }
+
+    /* 初始化最早 deadline 缓存，让无任务到期时可以 O(1) 快速返回。 */
+    Scheduler_UpdateNextDeadline();
 }
 
 /**
@@ -128,6 +154,38 @@ static bool Scheduler_IsDeadlineReached(uint32_t now_time, uint32_t deadline_ms)
 }
 
 /**
+ * @brief  重新计算任务表中的最早到期时间。
+ *
+ * @note   任务数量很少，只有在初始化或任务运行后才重算一次；
+ *         无任务到期的主循环热路径只读 s_scheduler_next_deadline_ms，不再扫描任务表。
+ *
+ * @param  无。
+ * @return 无。
+ */
+static void Scheduler_UpdateNextDeadline(void)
+{
+    /* 先用第 0 个任务 deadline 作为候选最早时间，任务表固定非空。 */
+    uint32_t next_deadline = Scheduler_Task[0].deadline_ms;
+
+    /* 从第 1 个任务开始比较，寻找相对当前候选更早的 deadline。 */
+    for (uint8_t i = 1U; i < SCHEDULER_TASK_COUNT; i++)
+    {
+        /*
+         * 如果候选 next_deadline 已经到达或越过当前任务 deadline，
+         * 说明当前任务 deadline 更早或相等，应更新缓存。
+         */
+        if (Scheduler_IsDeadlineReached(next_deadline, Scheduler_Task[i].deadline_ms) == true)
+        {
+            /* 更新当前观察到的最早任务到期时间。 */
+            next_deadline = Scheduler_Task[i].deadline_ms;
+        }
+    }
+
+    /* 保存最早 deadline，供 Scheduler_Run() 的快速路径使用。 */
+    s_scheduler_next_deadline_ms = next_deadline;
+}
+
+/**
  * @brief  推进任务下一次到期时间。
  *
  * @note   当前工程优先保证主循环公平性：任务迟到后只执行一次，不把历史积压周期
@@ -151,6 +209,7 @@ static void Scheduler_UpdateTaskDeadline(task_t *task, uint32_t now_time)
     task->deadline_ms = now_time + task->interval_time_ms;
 }
 
+#if SCHEDULER_ENABLE_STATS
 /**
  * @brief  记录一次任务调度迟到信息。
  *
@@ -234,6 +293,7 @@ static void Scheduler_RecordTaskRuntime(task_t *task, uint32_t start_time, uint3
         task->stats.overrun_count++;
     }
 }
+#endif
 
 /**
  * @brief  扫描任务表，并执行所有到期任务。
@@ -249,9 +309,20 @@ bool Scheduler_Run(void)
     /* 记录本轮扫描是否真的执行过任务，供主循环决定是否进入低功耗等待。 */
     bool has_task_run = false;
 
+    /* 当前 tick 还没到任何任务的最早 deadline 时，直接返回，避免空闲期反复扫描任务表。 */
+    if (Scheduler_IsDeadlineReached(Scheduler_GetTick(), s_scheduler_next_deadline_ms) == false)
+    {
+        /* 没有任务到期。 */
+        return false;
+    }
+
     /* 从任务表第 0 项开始逐项扫描，直到处理完当前登记的全部任务。 */
     for (uint8_t i = 0U; i < SCHEDULER_TASK_COUNT; i++)
     {
+#if defined(SCHEDULER_HOST_TEST)
+        /* 主机测试统计扫描次数，用于证明快速路径没有进入任务表循环。 */
+        s_scheduler_scan_count_for_test++;
+#endif
         /* 每处理一个任务前读取当前 tick，减少任务间等待造成的时间误差。 */
         uint32_t now_time = Scheduler_GetTick();
         /* 取得当前任务项地址，后续读写周期、上次运行时间和回调函数。 */
@@ -271,8 +342,13 @@ bool Scheduler_Run(void)
             uint32_t lateness_ms = (uint32_t)(now_time - task->deadline_ms);
             /* 保存任务开始时间，用于统计本次任务运行耗时。 */
             uint32_t start_time = Scheduler_GetTick();
+#if SCHEDULER_ENABLE_STATS
             /* 记录本次任务调度迟到和被跳过的历史周期。 */
             Scheduler_RecordTaskLateness(task, lateness_ms);
+#else
+            /* 关闭统计时仍保留变量计算路径，显式转 void 防止编译器告警。 */
+            (void)lateness_ms;
+#endif
             /* 调用当前任务函数，实际业务逻辑由 App 层函数完成。 */
             task->run_task();
             /* 标记本轮已经执行过任务，主循环本轮不需要进入空闲等待。 */
@@ -281,14 +357,38 @@ bool Scheduler_Run(void)
             now_time = Scheduler_GetTick();
             /* 任务结束后只安排下一次未来 deadline，不补跑历史积压周期。 */
             Scheduler_UpdateTaskDeadline(task, now_time);
+#if SCHEDULER_ENABLE_STATS
             /* 记录任务运行耗时，用于定位长阻塞任务。 */
             Scheduler_RecordTaskRuntime(task, start_time, now_time);
+#else
+            /* 关闭统计时不记录运行耗时，显式转 void 防止未使用变量告警。 */
+            (void)start_time;
+#endif
         }
     }
+
+    /* 本轮扫描后任务 deadline 可能变化，重新缓存下一轮最早到期时间。 */
+    Scheduler_UpdateNextDeadline();
 
     /* 返回本轮任务执行状态，便于裸机主循环在无任务时等待下一次中断唤醒。 */
     return has_task_run;
 }
+
+#if defined(SCHEDULER_HOST_TEST)
+/**
+ * @brief  返回调度器任务表扫描次数。
+ *
+ * @note   该函数只在主机测试构建中存在，用于验证 next-deadline 快速路径是否生效。
+ *
+ * @param  无。
+ * @return 调度器进入任务表循环的累计次数。
+ */
+uint32_t Scheduler_GetScanCountForTest(void)
+{
+    /* 返回主机测试诊断计数。 */
+    return s_scheduler_scan_count_for_test;
+}
+#endif
 
 /**
  * @brief  毫秒 tick 递增函数。
@@ -337,8 +437,25 @@ bool Scheduler_GetTaskStats(scheduler_task_id_t task_id, scheduler_task_stats_t 
         return false;
     }
 
+#if SCHEDULER_ENABLE_STATS
     /* 拷贝统计快照，避免外部直接修改调度器内部状态。 */
     *out_stats = task->stats;
+#else
+    /* 关闭统计时不读取 task 内容，显式转 void 防止编译器告警。 */
+    (void)task;
+    /*
+     * 关闭统计时仍保持 API 可用，但返回全 0 快照。
+     * 这样上层调试代码无需条件编译，只是看不到运行期统计。
+     */
+    out_stats->run_count = 0U;
+    out_stats->overrun_count = 0U;
+    out_stats->missed_deadline_count = 0U;
+    out_stats->max_runtime_ms = 0U;
+    out_stats->last_runtime_ms = 0U;
+    out_stats->max_lateness_ms = 0U;
+    out_stats->last_lateness_ms = 0U;
+    out_stats->last_start_ms = 0U;
+#endif
     /* 返回成功。 */
     return true;
 }
@@ -361,6 +478,7 @@ void Scheduler_ClearTaskStats(scheduler_task_id_t task_id)
         return;
     }
 
+#if SCHEDULER_ENABLE_STATS
     /* 逐项清零统计，避免引入 memset 依赖也便于后续字段扩展时显式维护。 */
     task->stats.run_count = 0U;
     task->stats.overrun_count = 0U;
@@ -370,6 +488,10 @@ void Scheduler_ClearTaskStats(scheduler_task_id_t task_id)
     task->stats.max_lateness_ms = 0U;
     task->stats.last_lateness_ms = 0U;
     task->stats.last_start_ms = 0U;
+#else
+    /* 关闭统计时不维护运行期计数，本函数保留为空操作以兼容调用方。 */
+    (void)task;
+#endif
 }
 
 #if !defined(SCHEDULER_HOST_TEST)

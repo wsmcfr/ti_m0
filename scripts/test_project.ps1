@@ -31,6 +31,16 @@ $hostTests = @(
         )
     },
     @{
+        Name = "scheduler_no_stats"
+        Output = "scheduler_test_no_stats.exe"
+        Args = @(
+            "-std=c99", "-Wall", "-Wextra", "-Werror",
+            "-DSCHEDULER_HOST_TEST", "-DSCHEDULER_ENABLE_STATS=0",
+            "-IUser", "-IUser/App", "-IUser/Driver",
+            "tests/scheduler_test.c", "User/scheduler.c"
+        )
+    },
+    @{
         Name = "gyro_protocol"
         Output = "gyro_protocol_test.exe"
         Args = @(

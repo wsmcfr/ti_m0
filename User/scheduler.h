@@ -9,6 +9,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifndef SCHEDULER_ENABLE_STATS
+/* 默认开启调度器统计；最终版可通过 -DSCHEDULER_ENABLE_STATS=0 关闭运行期统计写入。 */
+#define SCHEDULER_ENABLE_STATS  (1)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -62,7 +67,9 @@ typedef struct
     uint32_t interval_time_ms;     /* 任务运行间隔，单位为毫秒。 */
     uint32_t initial_offset_ms;    /* 首次运行相对初始化时刻的错峰偏移，降低同 tick 峰值。 */
     uint32_t deadline_ms;          /* 下一次应运行的时间戳，单位为毫秒。 */
+#if SCHEDULER_ENABLE_STATS
     scheduler_task_stats_t stats;  /* 任务运行统计，便于定位调度瓶颈。 */
+#endif
 } task_t;
 
 /* 与 STM32 HAL 风格目标框架兼容的毫秒计数变量，由 SysTick 中断递增。 */

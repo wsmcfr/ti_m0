@@ -71,10 +71,16 @@ void Scheduler_ClearTaskStats(scheduler_task_id_t task_id);
 
 Contracts:
 
+- `SCHEDULER_ENABLE_STATS` defaults to `1`; building with
+  `-DSCHEDULER_ENABLE_STATS=0` removes per-task runtime stats storage and
+  runtime stat writes while keeping the public stats APIs callable.
 - A task whose `deadline_ms` has passed is executed at most once during a single
   `Scheduler_Run()` scan.
 - `Scheduler_Run()` returns `true` when at least one task ran in the scan and
   returns `false` when no task was due; `empty.c` may use `false` to enter WFI.
+- The scheduler maintains a cached earliest deadline. If the current tick is
+  before that cached deadline, `Scheduler_Run()` must return `false` without
+  scanning the task table.
 - Low-priority or I/O-heavy tasks may use `initial_offset_ms` in the task table
   to avoid concentrating UART, OLED, and LED work on the same millisecond.
 - After a task returns, the next deadline is scheduled from the task end tick:
@@ -89,16 +95,21 @@ Contracts:
   periods: `lateness_ms / interval_time_ms`.
 - `Scheduler_ClearTaskStats()` must clear runtime, overrun, lateness, and missed
   deadline counters together.
+- When `SCHEDULER_ENABLE_STATS == 0`, `Scheduler_GetTaskStats()` returns `true`
+  for a valid task and writes a zero-filled `scheduler_task_stats_t`;
+  `Scheduler_ClearTaskStats()` is a compatible no-op for valid task IDs.
 
 Validation and error matrix:
 
 | Case | Required behavior | Test point |
 |------|-------------------|------------|
+| Tick is before earliest deadline | `Scheduler_Run()` returns `false` without scanning task entries | scheduler host test using host-only scan counter |
 | Task starts exactly at deadline | `last_lateness_ms == 0` | scheduler host test |
 | Low-priority tasks have offsets | UART/LED/OLED do not all run on the same 100 ms boundary | scheduler host test |
 | No task is due | `Scheduler_Run()` returns `false`, main loop may call `__WFI()` | scheduler host test / hardware smoke test |
 | Task runs longer than its interval | `overrun_count++`, next immediate scan does not rerun it | scheduler host test |
 | Tick jumps far past deadline | task runs once, missed periods are counted | scheduler host test |
+| Stats disabled build | task dispatch still works, stats API returns zero snapshot | scheduler no-stats host test |
 | Invalid task ID or null stats pointer | `Scheduler_GetTaskStats()` returns `false` | scheduler host test when expanded |
 
 Good/base/bad cases:
@@ -107,12 +118,16 @@ Good/base/bad cases:
   periods.
 - Good: UART, OLED, and LED use explicit initial offsets so display/log/heartbeat
   work does not pile up on the same tick boundary.
+- Good: the no-task hot path checks the cached earliest deadline and returns
+  before touching individual task entries.
 - Base: a task with no lateness keeps lateness counters at zero.
 - Bad: a `while` loop advances `deadline_ms` one period at a time and lets a
   high-frequency task immediately run again before lower-priority tasks can
   progress.
 - Bad: ignoring the `Scheduler_Run()` return value in the main loop and keeping
   the CPU spinning at full speed when no task is due.
+- Bad: making every idle loop scan the whole task table when the earliest
+  deadline is still in the future.
 
 Wrong vs correct:
 
@@ -129,6 +144,9 @@ task->deadline_ms = Scheduler_GetTick() + task->interval_time_ms;
 if (Scheduler_Run() == false) {
     __WFI();
 }
+
+/* Correct: final builds can remove stats writes without changing task dispatch. */
+/* Build flag: -DSCHEDULER_ENABLE_STATS=0 */
 ```
 
 Tests required:
@@ -136,12 +154,16 @@ Tests required:
 ```powershell
 gcc -std=c99 -Wall -Wextra -Werror -DSCHEDULER_HOST_TEST -IUser -IUser/App -IUser/Driver tests/scheduler_test.c User/scheduler.c -o tests/scheduler_test.exe
 .\tests\scheduler_test.exe
+
+gcc -std=c99 -Wall -Wextra -Werror -DSCHEDULER_HOST_TEST -DSCHEDULER_ENABLE_STATS=0 -IUser -IUser/App -IUser/Driver tests/scheduler_test.c User/scheduler.c -o tests/scheduler_test_no_stats.exe
+.\tests\scheduler_test_no_stats.exe
 ```
 
-Assertions must cover task order, initial deadline offsets, no immediate rerun
-after overrun, the `Scheduler_Run()` boolean return, `missed_deadline_count`,
-`last_lateness_ms`, `max_lateness_ms`, runtime stats, and clearing all stats
-fields.
+Assertions must cover task order, initial deadline offsets, earliest-deadline
+fast return without scanning, no immediate rerun after overrun, the
+`Scheduler_Run()` boolean return, `missed_deadline_count`, `last_lateness_ms`,
+`max_lateness_ms`, runtime stats, clearing all stats fields, and disabled-stats
+zero snapshots.
 
 ### Non-Blocking Gray ADC Sampling Contract
 
