@@ -21,13 +21,13 @@ volatile uint32_t uwTick = 0U;
 /* 任务表：按实时性从高到低排列，避免低优先级显示或心跳任务排在关键控制任务前面。 */
 static task_t Scheduler_Task[] =
 {
-    { SCHEDULER_TASK_ID_LINE_TRACK, LineTrack_AppTask, 1U, 0U, {0U} },
-    { SCHEDULER_TASK_ID_GYRO, Gyro_AppTask, 5U, 0U, {0U} },
-    { SCHEDULER_TASK_ID_MOTOR, Motor_AppTask, 5U, 0U, {0U} },
-    { SCHEDULER_TASK_ID_KEY, Key_AppTask, 5U, 0U, {0U} },
-    { SCHEDULER_TASK_ID_UART, Uart_AppTask, 20U, 0U, {0U} },
-    { SCHEDULER_TASK_ID_OLED, Oled_AppTask, 250U, 0U, {0U} },
-    { SCHEDULER_TASK_ID_LED, Led_AppTask, 100U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_LINE_TRACK, LineTrack_AppTask, 1U, 0U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_GYRO, Gyro_AppTask, 5U, 0U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_MOTOR, Motor_AppTask, 5U, 0U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_KEY, Key_AppTask, 5U, 0U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_UART, Uart_AppTask, 20U, 2U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_OLED, Oled_AppTask, 250U, 13U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_LED, Led_AppTask, 100U, 7U, 0U, {0U} },
 };
 
 /* 当前任务表中的任务数量由数组长度生成，编译期固定，避免运行期重复赋值。 */
@@ -42,8 +42,8 @@ static void Scheduler_RecordTaskRuntime(task_t *task, uint32_t start_time, uint3
 /**
  * @brief  初始化调度器任务表的运行基准时间。
  *
- * @note   初始化时把每个任务的 last_time_ms 设置为当前 tick，
- *         这样任务会在完整周期到期后第一次运行，而不是上电后立即运行。
+ * @note   初始化时把每个任务的首次 deadline 设置为当前 tick + 周期 + 初始错峰。
+ *         高频任务保持 0 offset，低频任务错开到不同相位，避免整百毫秒集中运行。
  *
  * @param  无。
  * @return 无。
@@ -58,9 +58,12 @@ void Scheduler_Init(void)
     {
         /*
          * 记录任务第一次到期时间，而不是上次运行时间。
-         * deadline 模式能把任务耗时和下一次周期基准解耦，减少长期漂移。
+         * 本调度器优先保证任务公平性：周期任务迟到后只运行一次，
+         * 任务结束后再从结束 tick 排下一次 deadline，因此不会回放历史积压周期。
          */
-        Scheduler_Task[i].deadline_ms = now_time + Scheduler_Task[i].interval_time_ms;
+        Scheduler_Task[i].deadline_ms = now_time +
+            Scheduler_Task[i].interval_time_ms +
+            Scheduler_Task[i].initial_offset_ms;
         /* 初始化时清空统计，保证每次 System_Init() 后统计都从零开始。 */
         Scheduler_Task[i].stats.run_count = 0U;
         Scheduler_Task[i].stats.overrun_count = 0U;
@@ -178,7 +181,7 @@ static void Scheduler_RecordTaskLateness(task_t *task, uint32_t lateness_ms)
     }
 
     /* 迟到达到一个或多个完整周期时，累计这些被跳过的历史周期。 */
-    if ((lateness_ms > 0U) && (task->interval_time_ms > 0U))
+    if ((task->interval_time_ms > 0U) && (lateness_ms >= task->interval_time_ms))
     {
         /* 只统计完整周期数量，不把亚周期级迟到记为漏周期。 */
         task->stats.missed_deadline_count += (lateness_ms / task->interval_time_ms);
@@ -239,10 +242,13 @@ static void Scheduler_RecordTaskRuntime(task_t *task, uint32_t start_time, uint3
  *         任务函数必须保持非阻塞，否则会影响其它任务的调度及时性。
  *
  * @param  无。
- * @return 无。
+ * @return true 表示本轮至少执行过一个任务；false 表示没有任务到期。
  */
-void Scheduler_Run(void)
+bool Scheduler_Run(void)
 {
+    /* 记录本轮扫描是否真的执行过任务，供主循环决定是否进入低功耗等待。 */
+    bool has_task_run = false;
+
     /* 从任务表第 0 项开始逐项扫描，直到处理完当前登记的全部任务。 */
     for (uint8_t i = 0U; i < SCHEDULER_TASK_COUNT; i++)
     {
@@ -269,6 +275,8 @@ void Scheduler_Run(void)
             Scheduler_RecordTaskLateness(task, lateness_ms);
             /* 调用当前任务函数，实际业务逻辑由 App 层函数完成。 */
             task->run_task();
+            /* 标记本轮已经执行过任务，主循环本轮不需要进入空闲等待。 */
+            has_task_run = true;
             /* 记录任务结束后的 tick，用于计算毫秒级运行耗时。 */
             now_time = Scheduler_GetTick();
             /* 任务结束后只安排下一次未来 deadline，不补跑历史积压周期。 */
@@ -277,6 +285,9 @@ void Scheduler_Run(void)
             Scheduler_RecordTaskRuntime(task, start_time, now_time);
         }
     }
+
+    /* 返回本轮任务执行状态，便于裸机主循环在无任务时等待下一次中断唤醒。 */
+    return has_task_run;
 }
 
 /**

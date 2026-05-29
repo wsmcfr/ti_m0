@@ -63,7 +63,7 @@ Scope / trigger: use this contract when changing `User/scheduler.c`,
 Signatures:
 
 ```c
-void Scheduler_Run(void);
+bool Scheduler_Run(void);
 bool Scheduler_GetTaskStats(scheduler_task_id_t task_id,
     scheduler_task_stats_t *out_stats);
 void Scheduler_ClearTaskStats(scheduler_task_id_t task_id);
@@ -73,6 +73,10 @@ Contracts:
 
 - A task whose `deadline_ms` has passed is executed at most once during a single
   `Scheduler_Run()` scan.
+- `Scheduler_Run()` returns `true` when at least one task ran in the scan and
+  returns `false` when no task was due; `empty.c` may use `false` to enter WFI.
+- Low-priority or I/O-heavy tasks may use `initial_offset_ms` in the task table
+  to avoid concentrating UART, OLED, and LED work on the same millisecond.
 - After a task returns, the next deadline is scheduled from the task end tick:
   `deadline_ms = Scheduler_GetTick() + interval_time_ms`.
 - The scheduler must not replay every missed historical period after a long
@@ -91,6 +95,8 @@ Validation and error matrix:
 | Case | Required behavior | Test point |
 |------|-------------------|------------|
 | Task starts exactly at deadline | `last_lateness_ms == 0` | scheduler host test |
+| Low-priority tasks have offsets | UART/LED/OLED do not all run on the same 100 ms boundary | scheduler host test |
+| No task is due | `Scheduler_Run()` returns `false`, main loop may call `__WFI()` | scheduler host test / hardware smoke test |
 | Task runs longer than its interval | `overrun_count++`, next immediate scan does not rerun it | scheduler host test |
 | Tick jumps far past deadline | task runs once, missed periods are counted | scheduler host test |
 | Invalid task ID or null stats pointer | `Scheduler_GetTaskStats()` returns `false` | scheduler host test when expanded |
@@ -99,10 +105,14 @@ Good/base/bad cases:
 
 - Good: a 1 ms task delayed until 150 ms runs once and records lateness/missed
   periods.
+- Good: UART, OLED, and LED use explicit initial offsets so display/log/heartbeat
+  work does not pile up on the same tick boundary.
 - Base: a task with no lateness keeps lateness counters at zero.
 - Bad: a `while` loop advances `deadline_ms` one period at a time and lets a
   high-frequency task immediately run again before lower-priority tasks can
   progress.
+- Bad: ignoring the `Scheduler_Run()` return value in the main loop and keeping
+  the CPU spinning at full speed when no task is due.
 
 Wrong vs correct:
 
@@ -114,6 +124,11 @@ while (deadline_is_in_the_past) {
 
 /* Correct: run once, record lateness, and schedule the next future deadline. */
 task->deadline_ms = Scheduler_GetTick() + task->interval_time_ms;
+
+/* Correct: idle main loop can sleep until the next SysTick or UART interrupt. */
+if (Scheduler_Run() == false) {
+    __WFI();
+}
 ```
 
 Tests required:
@@ -123,9 +138,10 @@ gcc -std=c99 -Wall -Wextra -Werror -DSCHEDULER_HOST_TEST -IUser -IUser/App -IUse
 .\tests\scheduler_test.exe
 ```
 
-Assertions must cover task order, no immediate rerun after overrun,
-`missed_deadline_count`, `last_lateness_ms`, `max_lateness_ms`, runtime stats,
-and clearing all stats fields.
+Assertions must cover task order, initial deadline offsets, no immediate rerun
+after overrun, the `Scheduler_Run()` boolean return, `missed_deadline_count`,
+`last_lateness_ms`, `max_lateness_ms`, runtime stats, and clearing all stats
+fields.
 
 ### Non-Blocking Gray ADC Sampling Contract
 

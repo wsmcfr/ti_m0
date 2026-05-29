@@ -71,6 +71,31 @@ static void SchedulerTest_RecordTask(scheduler_task_id_t task_id)
 }
 
 /**
+ * @brief  逐毫秒推进调度器到指定 tick，并丢弃推进过程中的调用日志。
+ *
+ * @param  target_tick 需要推进到的目标 tick，必须不早于当前 tick。
+ * @return 无。
+ */
+static void SchedulerTest_AdvanceToTick(uint32_t target_tick)
+{
+    /* 从当前 tick 开始逐步推进，避免直接跳时把历史到期任务挤到同一轮。 */
+    uint32_t tick = Scheduler_GetTick();
+
+    /* 每推进 1ms 就运行一次调度器，模拟真实主循环持续扫描的稳态行为。 */
+    while ((uint32_t)(target_tick - tick) > 0U)
+    {
+        /* 推进到下一个毫秒 tick。 */
+        tick++;
+        /* 测试中直接写 uwTick，模拟 SysTick 中断已经发生。 */
+        uwTick = tick;
+        /* 执行本毫秒的调度扫描。 */
+        (void)Scheduler_Run();
+        /* 丢弃推进过程日志，只保留调用者后续手动扫描的断言数据。 */
+        s_call_count = 0U;
+    }
+}
+
+/**
  * @brief  LED 桩任务。
  *
  * @param  无。
@@ -155,14 +180,17 @@ void Oled_AppTask(void)
  */
 static void test_realtime_tasks_run_before_low_priority_tasks(void)
 {
+    bool has_task_run;
+
     SchedulerTest_ResetStubs();
     uwTick = 0U;
     Scheduler_Init();
 
-    /* 推进到所有 1ms/5ms/20ms/100ms/250ms 任务都到期，便于一次扫描验证完整顺序。 */
-    uwTick = 250U;
-    Scheduler_Run();
+    /* 推进到所有任务的首次 deadline 都已到期，便于一次扫描验证完整顺序。 */
+    uwTick = 263U;
+    has_task_run = Scheduler_Run();
 
+    assert(has_task_run == true);
     assert(s_call_count == 7U);
     assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
     assert(s_calls[1].task_id == SCHEDULER_TASK_ID_GYRO);
@@ -174,6 +202,76 @@ static void test_realtime_tasks_run_before_low_priority_tasks(void)
 }
 
 /**
+ * @brief  验证低优先级任务使用初始错峰，避免所有任务在同一 tick 集中运行。
+ *
+ * @param  无。
+ * @return 无。
+ */
+static void test_scheduler_staggers_low_priority_initial_deadlines(void)
+{
+    bool has_task_run;
+
+    SchedulerTest_ResetStubs();
+    uwTick = 0U;
+    Scheduler_Init();
+
+    /*
+     * 逐毫秒推进到 99ms，建立真实稳态 deadline。
+     * 100ms 时只允许 1ms 和 5ms 任务到期，低优先级 UART/LED/OLED 不应挤在整百毫秒。
+     */
+    SchedulerTest_AdvanceToTick(99U);
+    uwTick = 100U;
+    has_task_run = Scheduler_Run();
+
+    assert(has_task_run == true);
+    assert(s_call_count == 4U);
+    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
+    assert(s_calls[1].task_id == SCHEDULER_TASK_ID_GYRO);
+    assert(s_calls[2].task_id == SCHEDULER_TASK_ID_MOTOR);
+    assert(s_calls[3].task_id == SCHEDULER_TASK_ID_KEY);
+
+    /*
+     * UART 使用 2ms 初始相位偏移，102ms 时应只和 1ms 任务同轮运行，
+     * 避开 5ms 串口/按键任务和整百毫秒心跳任务。
+     */
+    SchedulerTest_AdvanceToTick(101U);
+    s_call_count = 0U;
+    uwTick = 102U;
+    has_task_run = Scheduler_Run();
+
+    assert(has_task_run == true);
+    assert(s_call_count == 2U);
+    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
+    assert(s_calls[1].task_id == SCHEDULER_TASK_ID_UART);
+
+    /*
+     * LED 使用 7ms 初始相位偏移，107ms 时应只和 1ms 任务同轮运行。
+     */
+    SchedulerTest_AdvanceToTick(106U);
+    s_call_count = 0U;
+    uwTick = 107U;
+    has_task_run = Scheduler_Run();
+
+    assert(has_task_run == true);
+    assert(s_call_count == 2U);
+    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
+    assert(s_calls[1].task_id == SCHEDULER_TASK_ID_LED);
+
+    /*
+     * OLED 使用 13ms 初始相位偏移，263ms 时应只和 1ms 任务同轮运行。
+     */
+    SchedulerTest_AdvanceToTick(262U);
+    s_call_count = 0U;
+    uwTick = 263U;
+    has_task_run = Scheduler_Run();
+
+    assert(has_task_run == true);
+    assert(s_call_count == 2U);
+    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
+    assert(s_calls[1].task_id == SCHEDULER_TASK_ID_OLED);
+}
+
+/**
  * @brief  验证 deadline 推进避免任务耗时造成周期基准漂移。
  *
  * @param  无。
@@ -181,6 +279,7 @@ static void test_realtime_tasks_run_before_low_priority_tasks(void)
  */
 static void test_scheduler_skips_backlog_after_overrun(void)
 {
+    bool has_task_run;
     scheduler_task_stats_t stats;
 
     SchedulerTest_ResetStubs();
@@ -192,7 +291,8 @@ static void test_scheduler_skips_backlog_after_overrun(void)
 
     /* 第一次到期运行后，任务耗时超过周期。 */
     uwTick = 1U;
-    Scheduler_Run();
+    has_task_run = Scheduler_Run();
+    assert(has_task_run == true);
     assert(s_call_count >= 1U);
     assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
 
@@ -202,7 +302,8 @@ static void test_scheduler_skips_backlog_after_overrun(void)
      * 否则高频任务会把后续低频任务长期饿住。
      */
     s_call_count = 0U;
-    Scheduler_Run();
+    has_task_run = Scheduler_Run();
+    assert(has_task_run == false);
     assert(s_call_count == 0U);
 
     assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
@@ -221,6 +322,7 @@ static void test_scheduler_skips_backlog_after_overrun(void)
  */
 static void test_scheduler_records_lateness_and_missed_periods(void)
 {
+    bool has_task_run;
     scheduler_task_stats_t stats;
 
     SchedulerTest_ResetStubs();
@@ -232,8 +334,9 @@ static void test_scheduler_records_lateness_and_missed_periods(void)
      * 调度器应只调用一次该任务，并统计 149ms 迟到与 149 个被跳过周期。
      */
     uwTick = 150U;
-    Scheduler_Run();
+    has_task_run = Scheduler_Run();
 
+    assert(has_task_run == true);
     assert(s_call_count >= 1U);
     assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
     assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
@@ -251,6 +354,7 @@ static void test_scheduler_records_lateness_and_missed_periods(void)
  */
 static void test_scheduler_records_runtime_and_overrun_stats(void)
 {
+    bool has_task_run;
     scheduler_task_stats_t stats;
 
     SchedulerTest_ResetStubs();
@@ -260,8 +364,9 @@ static void test_scheduler_records_runtime_and_overrun_stats(void)
     /* 用 3ms 耗时触发灰度 1ms 任务超期统计。 */
     s_task_cost_ms[SCHEDULER_TASK_ID_LINE_TRACK] = 3U;
     uwTick = 1U;
-    Scheduler_Run();
+    has_task_run = Scheduler_Run();
 
+    assert(has_task_run == true);
     assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
     assert(stats.run_count == 1UL);
     assert(stats.max_runtime_ms == 3UL);
@@ -291,6 +396,7 @@ static void test_scheduler_records_runtime_and_overrun_stats(void)
 int main(void)
 {
     test_realtime_tasks_run_before_low_priority_tasks();
+    test_scheduler_staggers_low_priority_initial_deadlines();
     test_scheduler_skips_backlog_after_overrun();
     test_scheduler_records_lateness_and_missed_periods();
     test_scheduler_records_runtime_and_overrun_stats();

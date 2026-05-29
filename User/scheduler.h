@@ -60,6 +60,7 @@ typedef struct
     scheduler_task_id_t task_id; /* 任务固定 ID，用于统计查询和调试定位。 */
     void (*run_task)(void);        /* 任务函数指针，调度器到期后调用该函数。 */
     uint32_t interval_time_ms;     /* 任务运行间隔，单位为毫秒。 */
+    uint32_t initial_offset_ms;    /* 首次运行相对初始化时刻的错峰偏移，降低同 tick 峰值。 */
     uint32_t deadline_ms;          /* 下一次应运行的时间戳，单位为毫秒。 */
     scheduler_task_stats_t stats;  /* 任务运行统计，便于定位调度瓶颈。 */
 } task_t;
@@ -79,9 +80,9 @@ void Scheduler_Init(void);
  * @brief  运行一次调度器扫描。
  *
  * @param  无。
- * @return 无。
+ * @return true 表示本轮至少执行过一个任务；false 表示没有任务到期。
  */
-void Scheduler_Run(void);
+bool Scheduler_Run(void);
 
 /**
  * @brief  SysTick 中断中的毫秒 tick 递增入口。
