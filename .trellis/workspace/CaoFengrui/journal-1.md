@@ -227,3 +227,52 @@ Completed Trellis bootstrap for the MSPM0G3507 firmware project: filled backend 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: Add selected motor control APIs
+
+**Date**: 2026-05-29
+**Task**: Add selected motor control APIs
+**Branch**: `main`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| 项目 | 内容 |
+|------|------|
+| 电机控制接口 | 为 `motor_app` 增加 `Motor_AppSetSpeed()`、`Motor_AppSetSpeed2()`、`Motor_AppStop()`，支持按 0~3 电机编号控制单路/两路/停止。 |
+| 协议策略 | 保持底层 Modbus RTU 四路速度帧不变，App 层把单路/两路操作整理成完整四路速度快照发送。 |
+| 两路场景 | `Motor_AppSetSpeed2()` 会把未指定的两路主动写 0，避免只用两路电机时残留旧速度。 |
+| 测试 | 新增 `tests/motor_app_test.c`，使用 UART/tick 桩函数验证发送帧、状态缓存、非法索引拒绝和 CRC。 |
+| GitHub | 已推送到 `origin/main`。 |
+
+**验证**:
+- `gcc -std=c99 -Wall -Wextra -Werror -IUser/App -IUser/Driver -IUser tests/motor_app_test.c User/App/motor_app.c User/App/motor_protocol.c -o tests/motor_app_test.exe; .\\tests\\motor_app_test.exe`
+- `gcc -std=c99 -Wall -Wextra -Werror -IUser/App tests/motor_protocol_test.c User/App/motor_protocol.c -o tests/motor_protocol_test.exe; .\\tests\\motor_protocol_test.exe`
+- `gcc -std=c99 -Wall -Wextra -Werror -IUser/App -IUser/Driver -IUser tests/oled_app_format_test.c User/App/oled_app.c -o tests/oled_app_format_test.exe; .\\tests\\oled_app_format_test.exe`
+- `git diff --check`
+
+**限制**:
+- `make -C gcc clean all` 未运行成功，本机缺少 `make` 命令。
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `40f3798` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
