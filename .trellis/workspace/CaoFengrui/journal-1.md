@@ -175,3 +175,55 @@ Completed Trellis bootstrap for the MSPM0G3507 firmware project: filled backend 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: Scheduler deadline stats optimization
+
+**Date**: 2026-05-29
+**Task**: Scheduler deadline stats optimization
+**Branch**: `main`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| 项目 | 内容 |
+|------|------|
+| 调度器优先级 | 将任务顺序调整为巡线、陀螺仪、电机、按键、UART、OLED、LED，优先保障关键实时任务。 |
+| deadline 调度 | 将任务周期基准从 last_time 改为 deadline_ms，任务耗时不会直接重置下一次周期起点，减少长期漂移。 |
+| 运行统计 | 新增 scheduler_task_id_t、scheduler_task_stats_t、Scheduler_GetTaskStats()、Scheduler_ClearTaskStats()，可读取 run_count、overrun_count、max_runtime_ms、last_runtime_ms、last_start_ms。 |
+| 测试 | 新增 tests/scheduler_test.c，覆盖任务顺序、deadline 追赶和耗时/超期统计；并复跑现有陀螺仪、电机、灰度、OLED host 测试。 |
+
+**验证结果**:
+- scheduler tests passed
+- gyro_protocol_test: all tests passed
+- motor_protocol_test: all tests passed
+- gray_sensor_logic_test: all tests passed
+- oled_app_format_test: all tests passed
+- `make -C gcc clean all` 未运行成功：本机未安装 make。
+
+**Updated Files**:
+- `User/scheduler.c`
+- `User/scheduler.h`
+- `tests/scheduler_test.c`
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2d814eb` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

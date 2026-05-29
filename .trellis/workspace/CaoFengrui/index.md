@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 4
+- **Total Sessions**: 5
 - **Last Active**: 2026-05-29
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~177 | Active |
+| `journal-1.md` | ~229 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 5 | 2026-05-29 | Scheduler deadline stats optimization | `2d814eb` | `main` |
 | 4 | 2026-05-29 | MSPM0G3507 调度与非阻塞优化 | `8cb895b` | `main` |
 | 3 | 2026-05-29 | 集成电机循迹OLED按键底层模块 | `ccaaf0e` | `main` |
 | 2 | 2026-05-29 | PCB pin layout and gray sensor planning | `eedbc2d` | `main` |
