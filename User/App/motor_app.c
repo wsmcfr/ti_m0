@@ -23,6 +23,7 @@ static motor_app_status_t s_motor_status;
 static uint8_t s_motor_last_encoder_request = 0U;
 
 static bool Motor_AppSendFrame(const uint8_t *frame, size_t length);
+static bool Motor_AppSetSpeedSnapshot(const int16_t speeds[MOTOR_PROTOCOL_MOTOR_COUNT]);
 static void Motor_AppHandleRxPacket(const uint8_t *data, uint16_t length);
 
 /**
@@ -53,6 +54,43 @@ static bool Motor_AppSendFrame(const uint8_t *frame, size_t length)
     /* 成功发送后累加命令帧统计。 */
     s_motor_status.tx_count++;
     /* 返回成功给上层。 */
+    return true;
+}
+
+/**
+ * @brief  按完整四路速度快照发送速度命令并更新缓存。
+ *
+ * @note   电机驱动板协议要求从 0x0000 连续写 4 个速度寄存器。单路和两路便捷接口
+ *         也必须整理成四路快照后发送，避免只写部分寄存器造成驱动板状态不一致。
+ *
+ * @param  speeds 四路目标速度快照，按 A/B/C/D 顺序排列。
+ * @return true 表示速度帧发送完成；false 表示参数错误、构帧失败或 UART 发送失败。
+ */
+static bool Motor_AppSetSpeedSnapshot(const int16_t speeds[MOTOR_PROTOCOL_MOTOR_COUNT])
+{
+    /* 准备速度命令帧缓冲。 */
+    uint8_t frame[MOTOR_PROTOCOL_MAX_FRAME_SIZE];
+    /* 保存构造出的帧长度。 */
+    size_t length;
+
+    /* 速度快照不能为空，否则无法构造四路速度帧。 */
+    if (speeds == NULL)
+    {
+        /* 参数错误时不发送命令，也不改内部缓存。 */
+        return false;
+    }
+
+    /* 构造四路速度写入帧，底层协议仍保持一次写 4 个寄存器。 */
+    length = MotorProtocol_BuildSpeedFrame(speeds, frame, sizeof(frame));
+    if (Motor_AppSendFrame(frame, length) == false)
+    {
+        /* 发送失败时不更新目标速度快照，避免显示状态和实际命令不一致。 */
+        return false;
+    }
+
+    /* 发送成功后缓存目标速度，供 OLED 或其它模块显示。 */
+    memcpy(s_motor_status.desired_speed, speeds, sizeof(s_motor_status.desired_speed));
+    /* 返回成功。 */
     return true;
 }
 
@@ -200,30 +238,8 @@ bool Motor_AppEnableClosedLoop(void)
  */
 bool Motor_AppSetSpeeds(const int16_t speeds[MOTOR_PROTOCOL_MOTOR_COUNT])
 {
-    /* 准备速度命令帧缓冲。 */
-    uint8_t frame[MOTOR_PROTOCOL_MAX_FRAME_SIZE];
-    /* 保存构造出的帧长度。 */
-    size_t length;
-
-    /* 速度数组不能为空。 */
-    if (speeds == NULL)
-    {
-        /* 参数错误时不构帧。 */
-        return false;
-    }
-
-    /* 构造四路速度写入帧。 */
-    length = MotorProtocol_BuildSpeedFrame(speeds, frame, sizeof(frame));
-    if (Motor_AppSendFrame(frame, length) == false)
-    {
-        /* 发送失败时不更新目标速度快照。 */
-        return false;
-    }
-
-    /* 发送成功后缓存目标速度，供 OLED 或其他模块显示。 */
-    memcpy(s_motor_status.desired_speed, speeds, sizeof(s_motor_status.desired_speed));
-    /* 返回成功。 */
-    return true;
+    /* 复用快照发送函数，保持四路数组接口和便捷接口的发送/缓存语义完全一致。 */
+    return Motor_AppSetSpeedSnapshot(speeds);
 }
 
 /**
@@ -247,6 +263,94 @@ bool Motor_AppSetSpeed4(int16_t motor_a, int16_t motor_b, int16_t motor_c, int16
 
     /* 调用数组版本完成实际构帧和发送。 */
     return Motor_AppSetSpeeds(speeds);
+}
+
+/**
+ * @brief  设置指定一路电机速度。
+ *
+ * @note   motor_index 为 0~3，分别对应 A/B/C/D。函数会先复制当前目标速度缓存，
+ *         只修改指定一路，再按驱动板要求发送完整四路速度帧。
+ *
+ * @param  motor_index 电机索引，0~3 有效。
+ * @param  speed       目标速度，正负方向由电机驱动板协议定义。
+ * @return true 表示速度命令发送完成；false 表示索引非法或发送失败。
+ */
+bool Motor_AppSetSpeed(uint8_t motor_index, int16_t speed)
+{
+    /* 保存将要发送的四路速度快照。 */
+    int16_t speeds[MOTOR_PROTOCOL_MOTOR_COUNT];
+
+    /* 索引必须落在 A/B/C/D 四路范围内。 */
+    if (motor_index >= MOTOR_PROTOCOL_MOTOR_COUNT)
+    {
+        /* 非法索引不发送命令，避免误改未知电机寄存器。 */
+        return false;
+    }
+
+    /* 从当前缓存复制四路速度，保证单路修改不会清掉其它路目标速度。 */
+    memcpy(speeds, s_motor_status.desired_speed, sizeof(speeds));
+    /* 只覆盖调用方指定的电机速度。 */
+    speeds[motor_index] = speed;
+
+    /* 发送完整四路速度快照，并在成功后更新缓存。 */
+    return Motor_AppSetSpeedSnapshot(speeds);
+}
+
+/**
+ * @brief  一次设置当前使用的两路电机速度。
+ *
+ * @note   该接口面向只接两路电机的场景。未指定的两路会主动写 0，避免上一次
+ *         四路速度缓存残留导致未使用电机端口继续输出。
+ *
+ * @param  first_motor_index  第一台电机索引，0~3 有效。
+ * @param  first_speed        第一台电机目标速度。
+ * @param  second_motor_index 第二台电机索引，0~3 有效，且不能与第一台相同。
+ * @param  second_speed       第二台电机目标速度。
+ * @return true 表示速度命令发送完成；false 表示索引非法、重复或发送失败。
+ */
+bool Motor_AppSetSpeed2(uint8_t first_motor_index, int16_t first_speed,
+    uint8_t second_motor_index, int16_t second_speed)
+{
+    /* 两路使用模式下，未指定电机必须明确置 0。 */
+    int16_t speeds[MOTOR_PROTOCOL_MOTOR_COUNT] = {0};
+
+    /* 两个电机索引都必须在 A/B/C/D 范围内。 */
+    if ((first_motor_index >= MOTOR_PROTOCOL_MOTOR_COUNT) ||
+        (second_motor_index >= MOTOR_PROTOCOL_MOTOR_COUNT))
+    {
+        /* 非法索引不发送命令。 */
+        return false;
+    }
+
+    /* 同一路电机不能在两路接口中被赋两个速度，否则调用意图不明确。 */
+    if (first_motor_index == second_motor_index)
+    {
+        /* 重复索引不发送命令，让调用方显式修正参数。 */
+        return false;
+    }
+
+    /* 写入第一路使用中的电机速度。 */
+    speeds[first_motor_index] = first_speed;
+    /* 写入第二路使用中的电机速度。 */
+    speeds[second_motor_index] = second_speed;
+
+    /* 发送完整四路速度快照，未指定电机为 0。 */
+    return Motor_AppSetSpeedSnapshot(speeds);
+}
+
+/**
+ * @brief  停止指定一路电机。
+ *
+ * @note   本函数等价于 Motor_AppSetSpeed(motor_index, 0)，但用明确命名表达
+ *         “停止某一路”的业务意图，便于主控逻辑调用和阅读。
+ *
+ * @param  motor_index 电机索引，0~3 有效。
+ * @return true 表示停止命令发送完成；false 表示索引非法或发送失败。
+ */
+bool Motor_AppStop(uint8_t motor_index)
+{
+    /* 通过单路速度接口把目标速度置 0，保持缓存和发送语义一致。 */
+    return Motor_AppSetSpeed(motor_index, 0);
 }
 
 /**

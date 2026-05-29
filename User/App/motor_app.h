@@ -37,6 +37,10 @@ void Motor_AppTask(void);
 bool Motor_AppEnableClosedLoop(void);
 bool Motor_AppSetSpeeds(const int16_t speeds[MOTOR_PROTOCOL_MOTOR_COUNT]);
 bool Motor_AppSetSpeed4(int16_t motor_a, int16_t motor_b, int16_t motor_c, int16_t motor_d);
+bool Motor_AppSetSpeed(uint8_t motor_index, int16_t speed);
+bool Motor_AppSetSpeed2(uint8_t first_motor_index, int16_t first_speed,
+    uint8_t second_motor_index, int16_t second_speed);
+bool Motor_AppStop(uint8_t motor_index);
 bool Motor_AppSetPid(const motor_protocol_pid_t pid[MOTOR_PROTOCOL_MOTOR_COUNT]);
 bool Motor_AppRequestEncoder(uint8_t motor_index);
 bool Motor_AppGetStatus(motor_app_status_t *out_status);
