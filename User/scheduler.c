@@ -29,7 +29,7 @@ static task_t Scheduler_Task[] =
     { SCHEDULER_TASK_ID_MOTOR, Motor_AppTask, 5U, 0U, {0U, 0U, 0U, 0U, 0U} },
     { SCHEDULER_TASK_ID_KEY, Key_AppTask, 5U, 0U, {0U, 0U, 0U, 0U, 0U} },
     { SCHEDULER_TASK_ID_UART, Uart_AppTask, 20U, 0U, {0U, 0U, 0U, 0U, 0U} },
-    { SCHEDULER_TASK_ID_OLED, Oled_AppTask, 20U, 0U, {0U, 0U, 0U, 0U, 0U} },
+    { SCHEDULER_TASK_ID_OLED, Oled_AppTask, 150U, 0U, {0U, 0U, 0U, 0U, 0U} },
     { SCHEDULER_TASK_ID_LED, Led_AppTask, 100U, 0U, {0U, 0U, 0U, 0U, 0U} },
 };
 

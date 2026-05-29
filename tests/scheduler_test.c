@@ -159,8 +159,8 @@ static void test_realtime_tasks_run_before_low_priority_tasks(void)
     uwTick = 0U;
     Scheduler_Init();
 
-    /* 推进到所有 1ms/5ms/20ms/100ms 任务都到期，便于一次扫描验证完整顺序。 */
-    uwTick = 100U;
+    /* 推进到所有 1ms/5ms/20ms/100ms/150ms 任务都到期，便于一次扫描验证完整顺序。 */
+    uwTick = 150U;
     Scheduler_Run();
 
     assert(s_call_count == 7U);
