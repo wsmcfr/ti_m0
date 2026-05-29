@@ -124,3 +124,54 @@ Completed Trellis bootstrap for the MSPM0G3507 firmware project: filled backend 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: MSPM0G3507 调度与非阻塞优化
+
+**Date**: 2026-05-29
+**Task**: MSPM0G3507 调度与非阻塞优化
+**Branch**: `main`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| 项目 | 内容 |
+|------|------|
+| 会话主题 | MSPM0G3507 固件调度与非阻塞优化 |
+| 主提交 | `8cb895b feat: optimize scheduler responsiveness` |
+| 推送状态 | 已推送到 `origin/main`，远端指向 `8cb895b08dec709955e16dcd8d07e75b85c6389d` |
+| 调度优化 | 将灰度循迹读取改为 1ms 切片状态机，`LineTrack_AppTask` 从 20ms 周期调整为 1ms，降低单次任务占用时间 |
+| UART 优化 | 增加 `Uart_DriverTryWrite()` 和 `my_printf_try()` 非阻塞发送路径，忙时返回失败而不是阻塞等待 |
+| 日志优化 | 陀螺仪周期日志改为 UART 忙则跳过，避免遥测输出拖慢主循环调度 |
+| OLED 优化 | 增加 I2C 失败退避；OLED 初始化失败后不继续清屏，未接屏时减少反复超时等待 |
+| 测试覆盖 | 新增 `tests/oled_app_format_test.c`，覆盖 OLED 文本格式化逻辑 |
+| 验证结果 | `gyro_protocol_test`、`motor_protocol_test`、`gray_sensor_logic_test`、`oled_app_format_test` 通过；Keil Build 为 0 Error(s)、0 Warning(s) |
+| 保留事项 | 本地仍有 `ti_msp_dl_config.c` 的 SysConfig 生成文件空白差异，未纳入功能提交 |
+
+**经验记录**：
+- 在裸机协作式调度中，耗时外设访问应优先拆成小步状态机，避免一个任务独占主循环。
+- 串口日志必须允许忙时跳过或限频，调试输出不能成为实时路径上的阻塞点。
+- OLED/I2C 等可拔插外设应有失败退避和初始化失败短路，避免硬件缺失时持续拖慢系统。
+- SysConfig 生成文件应尽量避免手工修改；纯空白 churn 不应混入功能提交。
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8cb895b` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
