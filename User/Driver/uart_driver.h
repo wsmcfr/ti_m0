@@ -46,10 +46,13 @@ typedef struct
     uint32_t rx_error_count;     /* UART 接收异常或非法端口访问次数。 */
     uint32_t tx_packet_count;    /* 通过 DMA 成功发送完成的包数量。 */
     uint32_t tx_timeout_count;   /* 等待 DMA_DONE_TX 或 EOT_DONE 超时次数。 */
+    uint32_t tx_reject_count;    /* 非阻塞发送因忙、长度过大或参数非法被拒绝的次数。 */
 } uart_driver_stats_t;
 
 void Uart_DriverInit(void);
 bool Uart_DriverWrite(uart_driver_port_t port, const uint8_t *data, uint16_t length);
+bool Uart_DriverTryWrite(uart_driver_port_t port, const uint8_t *data, uint16_t length);
+bool Uart_DriverIsTxBusy(uart_driver_port_t port);
 bool Uart_DriverWriteByteBlocking(uart_driver_port_t port, uint8_t data);
 uint16_t Uart_DriverReadPacket(uart_driver_port_t port, uint8_t *out_data, uint16_t max_length);
 uint16_t Uart_DriverGetPendingLength(uart_driver_port_t port);

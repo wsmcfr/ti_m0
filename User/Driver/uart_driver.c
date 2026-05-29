@@ -45,6 +45,7 @@ typedef struct
     volatile uint32_t rx_error_count;              /* 接收错误或非法访问计数。 */
     volatile uint32_t tx_packet_count;             /* 成功完成的 TX 包数量。 */
     volatile uint32_t tx_timeout_count;            /* TX 等待超时计数。 */
+    volatile uint32_t tx_reject_count;             /* 非阻塞发送被拒绝次数，用于观察日志或命令丢弃情况。 */
 } uart_driver_context_t;
 
 /* 三路串口的硬件资源表，和 empty.syscfg 里的 UART_PC/UART_GYRO/UART_MOTOR、DMA 通道保持一致。 */
@@ -75,6 +76,8 @@ static bool s_uart_driver_initialized = false;
 
 static uart_driver_context_t *Uart_DriverGetContext(uart_driver_port_t port);
 static void Uart_DriverStartRxDma(uart_driver_context_t *ctx);
+static bool Uart_DriverStartTxDma(uart_driver_context_t *ctx, const uint8_t *data,
+    uint16_t length);
 static void Uart_DriverPublishRxPacket(uart_driver_context_t *ctx, uint16_t length);
 static void Uart_DriverCaptureRxByIdle(uart_driver_context_t *ctx);
 static void Uart_DriverHandleIrq(uart_driver_context_t *ctx);
@@ -129,6 +132,53 @@ static void Uart_DriverStartRxDma(uart_driver_context_t *ctx)
     DL_DMA_setTransferSize(DMA, ctx->rx_dma_chan, UART_DRIVER_RX_DMA_BUFFER_SIZE);
     /* 重新打开 RX DMA 通道，使 UART 后续收到的字节继续搬入缓冲区。 */
     DL_DMA_enableChannel(DMA, ctx->rx_dma_chan);
+}
+
+/**
+ * @brief  启动某一路 UART 的 TX DMA 发送。
+ *
+ * @note   调用者必须保证 ctx、data 和 length 已经通过检查，且当前端口不忙。
+ *         本函数只负责配置硬件并置位运行状态，不等待 DMA_DONE_TX 或 EOT_DONE。
+ *
+ * @param  ctx    串口运行上下文。
+ * @param  data   待发送数据缓冲。
+ * @param  length 待发送字节数。
+ * @return true 表示 DMA 已经启动；false 表示参数无效。
+ */
+static bool Uart_DriverStartTxDma(uart_driver_context_t *ctx, const uint8_t *data,
+    uint16_t length)
+{
+    /* 检查关键参数，避免后续写 DMA 寄存器时访问无效地址。 */
+    if ((ctx == NULL) || (data == NULL) || (length == 0U))
+    {
+        /* 参数无效时不能启动发送。 */
+        return false;
+    }
+
+    /* 标记当前端口进入发送忙状态，直到 EOT 中断确认线端发送完成。 */
+    ctx->tx_busy = true;
+    /* 清除本次发送的 DMA 搬运完成标志，等待 UART DMA_DONE_TX 中断重新置位。 */
+    ctx->tx_dma_done = false;
+    /* 清除本次发送的线端完成标志，等待 UART EOT_DONE 中断重新置位。 */
+    ctx->tx_eot_done = false;
+
+    /* 停止 TX DMA 通道，确保后续重新配置源、目的和长度安全。 */
+    DL_DMA_disableChannel(DMA, ctx->tx_dma_chan);
+    /* 清除 UART 中可能残留的 TX DMA/EOT 中断状态，避免误判本次发送已完成。 */
+    DL_UART_Main_clearInterruptStatus(ctx->uart,
+        DL_UART_MAIN_INTERRUPT_DMA_DONE_TX | DL_UART_MAIN_INTERRUPT_EOT_DONE);
+
+    /* 设置 TX DMA 源地址为调用者提供的数据缓冲区。 */
+    DL_DMA_setSrcAddr(DMA, ctx->tx_dma_chan, (uint32_t)data);
+    /* 设置 TX DMA 目的地址为当前 UART 的 TXDATA 寄存器。 */
+    DL_DMA_setDestAddr(DMA, ctx->tx_dma_chan, (uint32_t)(&ctx->uart->TXDATA));
+    /* 设置 TX DMA 本次需要搬运的字节数。 */
+    DL_DMA_setTransferSize(DMA, ctx->tx_dma_chan, length);
+    /* 启动 TX DMA，让数据按 UART TX 触发节奏写入发送 FIFO。 */
+    DL_DMA_enableChannel(DMA, ctx->tx_dma_chan);
+
+    /* DMA 已经启动，后续完成状态由 UART 中断维护。 */
+    return true;
 }
 
 /**
@@ -286,6 +336,14 @@ static void Uart_DriverHandleIrq(uart_driver_context_t *ctx)
                 /* EOT 表示 UART 移位寄存器发送完毕，可以安全复用发送缓冲。 */
                 /* 标记串口线上的最后一位也已发送完成，解除发送函数的第二阶段等待。 */
                 ctx->tx_eot_done = true;
+                /* 非阻塞发送依赖中断释放忙标志，避免下一包一直被判定为忙。 */
+                if (ctx->tx_busy == true)
+                {
+                    /* 本包线端已经真正发送完成，允许后续发送复用同一 DMA 通道。 */
+                    ctx->tx_busy = false;
+                    /* 成功完成一包发送，累加发送包计数。 */
+                    ctx->tx_packet_count++;
+                }
                 /* 当前事件处理完成，继续检查是否还有其它中断。 */
                 break;
 
@@ -358,6 +416,8 @@ void Uart_DriverInit(void)
         ctx->tx_packet_count = 0U;
         /* 清零发送超时计数，便于后续判断硬件或中断是否异常。 */
         ctx->tx_timeout_count = 0U;
+        /* 清零非阻塞发送拒绝计数，便于观察本次运行后的真实丢弃情况。 */
+        ctx->tx_reject_count = 0U;
 
         /*
          * RX timeout 是本工程的“串口空闲中断”来源。
@@ -429,27 +489,14 @@ bool Uart_DriverWrite(uart_driver_port_t port, const uint8_t *data, uint16_t len
         return false;
     }
 
-    /* 标记当前端口进入发送忙状态，防止并发发送复用同一 DMA 通道。 */
-    ctx->tx_busy = true;
-    /* 清除本次发送的 DMA 完成标志，等待中断重新置位。 */
-    ctx->tx_dma_done = false;
-    /* 清除本次发送的 EOT 完成标志，等待 UART 线端真正发送完成。 */
-    ctx->tx_eot_done = false;
-
-    /* 停止 TX DMA 通道，确保后续重新配置源、目的和长度安全。 */
-    DL_DMA_disableChannel(DMA, ctx->tx_dma_chan);
-    /* 清除 UART 中可能残留的 TX DMA/EOT 中断状态，避免误判本次发送已完成。 */
-    DL_UART_Main_clearInterruptStatus(ctx->uart,
-        DL_UART_MAIN_INTERRUPT_DMA_DONE_TX | DL_UART_MAIN_INTERRUPT_EOT_DONE);
-
-    /* 设置 TX DMA 源地址为调用者提供的数据缓冲区。 */
-    DL_DMA_setSrcAddr(DMA, ctx->tx_dma_chan, (uint32_t)data);
-    /* 设置 TX DMA 目的地址为当前 UART 的 TXDATA 寄存器。 */
-    DL_DMA_setDestAddr(DMA, ctx->tx_dma_chan, (uint32_t)(&ctx->uart->TXDATA));
-    /* 设置 TX DMA 本次需要搬运的字节数。 */
-    DL_DMA_setTransferSize(DMA, ctx->tx_dma_chan, length);
-    /* 启动 TX DMA，让数据按 UART TX 触发节奏写入发送 FIFO。 */
-    DL_DMA_enableChannel(DMA, ctx->tx_dma_chan);
+    /* 启动 TX DMA；阻塞式接口随后会等待 DMA 和线端完成。 */
+    if (Uart_DriverStartTxDma(ctx, data, length) == false)
+    {
+        /* 正常参数路径不应失败，失败时按发送异常处理。 */
+        ctx->tx_timeout_count++;
+        /* 返回发送失败。 */
+        return false;
+    }
 
     /* 按发送长度扩大等待上限，覆盖较长数据在低波特率下的耗时。 */
     wait_count = UART_DRIVER_TX_WAIT_BASE + ((uint32_t)length * UART_DRIVER_TX_WAIT_PER_BYTE);
@@ -467,6 +514,10 @@ bool Uart_DriverWrite(uart_driver_port_t port, const uint8_t *data, uint16_t len
         DL_DMA_disableChannel(DMA, ctx->tx_dma_chan);
         /* 释放发送忙标志，避免后续发送一直被阻塞。 */
         ctx->tx_busy = false;
+        /* 清除异常发送残留标志，避免下次发送被旧状态影响。 */
+        ctx->tx_dma_done = false;
+        /* 清除异常发送的线端完成标志。 */
+        ctx->tx_eot_done = false;
         /* 记录超时统计，便于调试。 */
         ctx->tx_timeout_count++;
         /* 返回发送失败。 */
@@ -487,18 +538,99 @@ bool Uart_DriverWrite(uart_driver_port_t port, const uint8_t *data, uint16_t len
     {
         /* 释放发送忙标志，允许后续尝试重新发送。 */
         ctx->tx_busy = false;
+        /* 清除异常发送残留标志，避免后续统计或状态判断混淆。 */
+        ctx->tx_dma_done = false;
+        /* 清除线端完成标志，本次发送实际未确认完成。 */
+        ctx->tx_eot_done = false;
         /* 记录发送超时统计。 */
         ctx->tx_timeout_count++;
         /* 返回发送失败。 */
         return false;
     }
 
-    /* DMA 和 UART 线端都完成后释放发送忙状态。 */
+    /*
+     * DMA 和 UART 线端都完成后释放发送忙状态。
+     * 如果 EOT 中断已经先释放过，这里再次写 false 是幂等的。
+     */
     ctx->tx_busy = false;
-    /* 成功完成一包发送，累加发送包计数。 */
-    ctx->tx_packet_count++;
     /* 通知调用者本次阻塞式 DMA 发送成功完成。 */
     return true;
+}
+
+/**
+ * @brief  尝试使用 TX DMA 发送一段数据，若端口忙则立即返回。
+ *
+ * @note   本函数不会等待 DMA_DONE_TX 或 EOT_DONE，适合周期任务里的日志输出。
+ *         调用者必须保证 data 指向的缓冲在 EOT_DONE 中断前不会被改写或释放。
+ *
+ * @param  port   串口逻辑编号。
+ * @param  data   待发送数据地址。
+ * @param  length 待发送字节数，0 表示不发送但返回成功。
+ * @return true 表示本次发送已经启动或为空发送；false 表示参数错误或端口正忙。
+ */
+bool Uart_DriverTryWrite(uart_driver_port_t port, const uint8_t *data, uint16_t length)
+{
+    /* 根据逻辑端口查找硬件上下文，后续通过该上下文访问 UART 和 DMA。 */
+    uart_driver_context_t *ctx = Uart_DriverGetContext(port);
+
+    /* 检查端口是否合法，并且在需要发送数据时检查数据指针是否有效。 */
+    if ((ctx == NULL) || ((data == NULL) && (length > 0U)))
+    {
+        /* 非阻塞接口不能等待或修复参数错误，直接返回失败。 */
+        return false;
+    }
+
+    /* 长度为 0 表示没有实际数据要发送，按空发送成功处理。 */
+    if (length == 0U)
+    {
+        /* 空数据不占用 DMA 或 UART。 */
+        return true;
+    }
+
+    /* 端口忙时立即拒绝本次发送，保证周期任务不会卡住调度器。 */
+    if (ctx->tx_busy == true)
+    {
+        /* 记录拒绝次数，便于判断日志频率是否过高。 */
+        ctx->tx_reject_count++;
+        /* 告诉调用者本次没有启动发送。 */
+        return false;
+    }
+
+    /* 启动 DMA 发送，不等待完成。 */
+    if (Uart_DriverStartTxDma(ctx, data, length) == false)
+    {
+        /* 记录拒绝次数，便于调试非法调用或异常路径。 */
+        ctx->tx_reject_count++;
+        /* 启动失败。 */
+        return false;
+    }
+
+    /* 发送已经启动，完成后由 UART 中断释放 busy 并累加 tx_packet_count。 */
+    return true;
+}
+
+/**
+ * @brief  查询某一路 UART TX DMA 是否正在发送。
+ *
+ * @note   非阻塞日志在改写静态缓冲前调用本函数，避免 DMA 尚未完成时覆盖发送内容。
+ *
+ * @param  port 串口逻辑编号。
+ * @return true 表示端口正在发送或端口非法；false 表示当前可尝试启动新发送。
+ */
+bool Uart_DriverIsTxBusy(uart_driver_port_t port)
+{
+    /* 根据逻辑端口查找硬件上下文。 */
+    uart_driver_context_t *ctx = Uart_DriverGetContext(port);
+
+    /* 非法端口按忙处理，防止上层误以为空闲后继续写入。 */
+    if (ctx == NULL)
+    {
+        /* 没有有效上下文，保守返回忙。 */
+        return true;
+    }
+
+    /* 返回当前发送忙标志。 */
+    return ctx->tx_busy;
 }
 
 /**
@@ -676,6 +808,8 @@ void Uart_DriverGetStats(uart_driver_port_t port, uart_driver_stats_t *out_stats
     out_stats->tx_packet_count = ctx->tx_packet_count;
     /* 输出发送等待超时次数。 */
     out_stats->tx_timeout_count = ctx->tx_timeout_count;
+    /* 输出非阻塞发送被拒绝次数。 */
+    out_stats->tx_reject_count = ctx->tx_reject_count;
 }
 
 /**

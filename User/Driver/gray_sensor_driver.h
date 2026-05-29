@@ -21,6 +21,7 @@ extern "C" {
 
 void GraySensor_DriverInit(void);
 bool GraySensor_DriverSelectChannel(uint8_t channel);
+bool GraySensor_DriverSampleSelected(uint16_t *out_value);
 bool GraySensor_DriverReadChannel(uint8_t channel, uint16_t *out_value);
 bool GraySensor_DriverReadAll(uint16_t *out_values, uint8_t max_count);
 

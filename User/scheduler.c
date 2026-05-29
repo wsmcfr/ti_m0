@@ -28,7 +28,7 @@ static task_t Scheduler_Task[] =
     { Key_AppTask, 5U, 0U },
     { Uart_AppTask, 20U, 0U },
     { Gyro_AppTask, 5U, 0U },
-    { LineTrack_AppTask, 20U, 0U },
+    { LineTrack_AppTask, 1U, 0U },
     { Motor_AppTask, 5U, 0U },
     { Oled_AppTask, 20U, 0U },
 };

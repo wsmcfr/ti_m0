@@ -27,6 +27,9 @@
 /* 6x8 ASCII 字库覆盖 0x20~0x7E，一共 95 个可打印字符。 */
 #define OLED_DRIVER_FONT_CHAR_COUNT     (95U)
 
+/* 128 像素宽度下最多可一次显示 21 个 6x8 字符。 */
+#define OLED_DRIVER_TEXT_COLUMNS        (OLED_DRIVER_WIDTH / 6U)
+
 /* 6x8 ASCII 字体，覆盖 0x20~0x7E。来源为常见 SSD1306 6x8 字库，按列发送。 */
 static const uint8_t s_oled_font_6x8[][6] =
 {
@@ -93,6 +96,9 @@ static const uint8_t s_oled_init_commands[] =
     0xDB, 0x40, 0xA4, 0xA6, 0x8D, 0x14, 0xAF
 };
 
+/* true 表示最近一次 OLED I2C 访问成功；应用层可据此决定是否继续刷新。 */
+static bool s_oled_driver_available = false;
+
 static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t length);
 
 /**
@@ -119,6 +125,7 @@ static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t
     if ((data == NULL) || (length == 0U))
     {
         /* OLED 写入不接受空 payload。 */
+        s_oled_driver_available = false;
         return false;
     }
 
@@ -133,6 +140,7 @@ static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t
     if (wait_count == 0UL)
     {
         /* I2C 控制器长期忙，返回失败。 */
+        s_oled_driver_available = false;
         return false;
     }
 
@@ -167,6 +175,7 @@ static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t
             /* 复位控制器传输状态，便于下次尝试恢复。 */
             DL_I2C_resetControllerTransfer(I2C_OLED_INST);
             /* 返回失败，提示 OLED 可能未连接或地址不匹配。 */
+            s_oled_driver_available = false;
             return false;
         }
 
@@ -180,6 +189,7 @@ static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t
         /* 复位 I2C 控制器传输寄存器，避免后续调用一直忙。 */
         DL_I2C_resetControllerTransfer(I2C_OLED_INST);
         /* 返回超时失败。 */
+        s_oled_driver_available = false;
         return false;
     }
 
@@ -188,10 +198,12 @@ static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t
             DL_I2C_CONTROLLER_STATUS_ERROR) != 0U)
     {
         /* 错误状态下不认为写入成功。 */
+        s_oled_driver_available = false;
         return false;
     }
 
     /* 写入完成。 */
+    s_oled_driver_available = true;
     return true;
 }
 
@@ -205,11 +217,15 @@ static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t
  */
 void Oled_DriverInit(void)
 {
-    /* 逐条发送 SSD1306 初始化命令。 */
-    for (uint16_t i = 0U; i < (uint16_t)sizeof(s_oled_init_commands); i++)
+    /*
+     * 批量发送 SSD1306 初始化命令，减少上电时的 START/STOP 事务数量。
+     * 初始化失败不阻塞系统启动，后续清屏或显示调用仍会用返回值暴露失败。
+     */
+    if (Oled_DriverWriteCommandBuffer(s_oled_init_commands,
+        (uint16_t)sizeof(s_oled_init_commands)) == false)
     {
-        /* 初始化阶段忽略单条失败，最终应用层可通过显示效果判断硬件连接。 */
-        (void)Oled_DriverWriteCommand(s_oled_init_commands[i]);
+        /* 未接屏或地址错误时不继续清屏，避免启动阶段多次进入 I2C 超时。 */
+        return;
     }
 
     /* 初始化完成后清空屏幕。 */
@@ -229,6 +245,21 @@ bool Oled_DriverWriteCommand(uint8_t command)
 }
 
 /**
+ * @brief  向 SSD1306 连续写入多条命令。
+ *
+ * @note   多条命令共用一次 I2C 事务，可减少页/列定位和初始化阶段的总线开销。
+ *
+ * @param  commands 命令数组。
+ * @param  length   命令字节数，不包含 SSD1306 控制字节。
+ * @return true 表示 I2C 写入成功；false 表示参数非法或写入失败。
+ */
+bool Oled_DriverWriteCommandBuffer(const uint8_t *commands, uint16_t length)
+{
+    /* 使用控制字节 0x00 发送连续命令。 */
+    return Oled_DriverWriteBytes(OLED_DRIVER_CONTROL_COMMAND, commands, length);
+}
+
+/**
  * @brief  向 SSD1306 写一个显示数据字节。
  *
  * @param  data 显示数据字节。
@@ -238,6 +269,21 @@ bool Oled_DriverWriteData(uint8_t data)
 {
     /* 使用控制字节 0x40 发送显示数据。 */
     return Oled_DriverWriteBytes(OLED_DRIVER_CONTROL_DATA, &data, 1U);
+}
+
+/**
+ * @brief  向 SSD1306 连续写入一段显示数据。
+ *
+ * @note   调用者需要先设置 GDDRAM 位置；本函数只负责把连续列数据一次写出。
+ *
+ * @param  data   显示数据数组。
+ * @param  length 显示数据字节数，不包含 SSD1306 控制字节。
+ * @return true 表示 I2C 写入成功；false 表示参数非法或写入失败。
+ */
+bool Oled_DriverWriteDataBuffer(const uint8_t *data, uint16_t length)
+{
+    /* 使用控制字节 0x40 发送连续显存数据。 */
+    return Oled_DriverWriteBytes(OLED_DRIVER_CONTROL_DATA, data, length);
 }
 
 /**
@@ -264,8 +310,7 @@ bool Oled_DriverClear(void)
         }
 
         /* 写入整页 0 数据。 */
-        if (Oled_DriverWriteBytes(OLED_DRIVER_CONTROL_DATA, clear_line,
-                OLED_DRIVER_WIDTH) == false)
+        if (Oled_DriverWriteDataBuffer(clear_line, OLED_DRIVER_WIDTH) == false)
         {
             /* 当前页写失败。 */
             return false;
@@ -287,6 +332,9 @@ bool Oled_DriverClear(void)
  */
 bool Oled_DriverSetPosition(uint8_t x, uint8_t page)
 {
+    /* SSD1306 页地址和列地址命令，三条命令可放在一次 I2C 事务中发送。 */
+    uint8_t position_commands[3];
+
     /* 坐标必须落在 OLED 显示范围内。 */
     if ((x >= OLED_DRIVER_WIDTH) || (page >= OLED_DRIVER_PAGE_COUNT))
     {
@@ -295,26 +343,15 @@ bool Oled_DriverSetPosition(uint8_t x, uint8_t page)
     }
 
     /* 设置页地址。 */
-    if (Oled_DriverWriteCommand((uint8_t)(0xB0U + page)) == false)
-    {
-        /* 页地址命令失败。 */
-        return false;
-    }
+    position_commands[0] = (uint8_t)(0xB0U + page);
     /* 设置列地址高 4 位。 */
-    if (Oled_DriverWriteCommand((uint8_t)(0x10U | ((x >> 4U) & 0x0FU))) == false)
-    {
-        /* 高列地址命令失败。 */
-        return false;
-    }
+    position_commands[1] = (uint8_t)(0x10U | ((x >> 4U) & 0x0FU));
     /* 设置列地址低 4 位。 */
-    if (Oled_DriverWriteCommand((uint8_t)(x & 0x0FU)) == false)
-    {
-        /* 低列地址命令失败。 */
-        return false;
-    }
+    position_commands[2] = (uint8_t)(x & 0x0FU);
 
-    /* 位置设置成功。 */
-    return true;
+    /* 批量写出三条定位命令，减少每次定位的 I2C 事务数量。 */
+    return Oled_DriverWriteCommandBuffer(position_commands,
+        (uint16_t)sizeof(position_commands));
 }
 
 /**
@@ -359,8 +396,7 @@ bool Oled_DriverShowChar(uint8_t x, uint8_t page, char ch)
     }
 
     /* 写入 6 列字模数据。 */
-    return Oled_DriverWriteBytes(OLED_DRIVER_CONTROL_DATA,
-        s_oled_font_6x8[index], 6U);
+    return Oled_DriverWriteDataBuffer(s_oled_font_6x8[index], 6U);
 }
 
 /**
@@ -375,34 +411,68 @@ bool Oled_DriverShowChar(uint8_t x, uint8_t page, char ch)
  */
 bool Oled_DriverShowString(uint8_t x, uint8_t page, const char *text)
 {
-    /* 当前写入列坐标。 */
-    uint8_t cursor_x = x;
+    /* 一行最多 21 个 6x8 字符，每个字符 6 列，刚好落在 128 像素宽度内。 */
+    uint8_t row_buffer[OLED_DRIVER_TEXT_COLUMNS * 6U];
+    /* 已经写入 row_buffer 的显存列数。 */
+    uint16_t row_length = 0U;
+    /* 当前待显示字符的字库索引。 */
+    uint8_t index;
 
     /* 字符串不能为空，页坐标必须有效。 */
-    if ((text == NULL) || (page >= OLED_DRIVER_PAGE_COUNT))
+    if ((text == NULL) || (page >= OLED_DRIVER_PAGE_COUNT) || (x >= OLED_DRIVER_WIDTH))
     {
         /* 参数无效。 */
         return false;
     }
 
-    /* 逐字符写入，直到字符串结束或本页剩余空间不足。 */
-    while ((*text != '\0') && (cursor_x <= (OLED_DRIVER_WIDTH - 6U)))
+    /*
+     * 把多个字符先拼成连续显存列数据，再一次写出。
+     * 这样一整行只需要“定位命令 + 数据写入”两次 I2C 事务。
+     */
+    while ((*text != '\0') &&
+           ((uint16_t)x + row_length + 6U <= OLED_DRIVER_WIDTH) &&
+           (row_length + 6U <= (uint16_t)sizeof(row_buffer)))
     {
-        /* 写入当前字符。 */
-        if (Oled_DriverShowChar(cursor_x, page, *text) == false)
+        /* 非可打印 ASCII 统一显示为空格，避免字库越界。 */
+        if ((*text < ' ') || (*text > '~'))
         {
-            /* 任一字符写失败则返回失败。 */
-            return false;
+            /* 空格在字库索引 0。 */
+            index = 0U;
+        }
+        else
+        {
+            /* 字库从 ASCII 0x20 开始。 */
+            index = (uint8_t)((uint8_t)(*text) - (uint8_t)' ');
         }
 
-        /* 移动到下一个字符位置。 */
-        cursor_x = (uint8_t)(cursor_x + 6U);
+        /* 复制当前字符 6 列字模到行缓冲尾部。 */
+        for (uint8_t i = 0U; i < 6U; i++)
+        {
+            /* row_length 始终按 6 字节递增，不会越过 row_buffer。 */
+            row_buffer[row_length + i] = s_oled_font_6x8[index][i];
+        }
+
+        /* 累加已经准备好的显存列数。 */
+        row_length = (uint16_t)(row_length + 6U);
         /* 指向下一个输入字符。 */
         text++;
     }
 
-    /* 字符串写入完成。 */
-    return true;
+    if (row_length == 0U)
+    {
+        /* 空字符串或剩余空间不足时无需写屏，视为成功。 */
+        return true;
+    }
+
+    /* 先设置起始写入位置。 */
+    if (Oled_DriverSetPosition(x, page) == false)
+    {
+        /* 定位失败则不继续写数据。 */
+        return false;
+    }
+
+    /* 一次写出整段字符串显存列数据。 */
+    return Oled_DriverWriteDataBuffer(row_buffer, row_length);
 }
 
 /**
@@ -481,19 +551,12 @@ bool Oled_DriverShowSignedNumber(uint8_t x, uint8_t page, int32_t value, uint8_t
  */
 bool Oled_DriverDisplayOn(void)
 {
-    /* 按 SSD1306 流程打开电荷泵。 */
-    if (Oled_DriverWriteCommand(0x8DU) == false)
-    {
-        /* 命令失败。 */
-        return false;
-    }
-    if (Oled_DriverWriteCommand(0x14U) == false)
-    {
-        /* 参数失败。 */
-        return false;
-    }
-    /* 打开显示。 */
-    return Oled_DriverWriteCommand(0xAFU);
+    /* 打开电荷泵并开启显示输出。 */
+    static const uint8_t display_on_commands[] = {0x8DU, 0x14U, 0xAFU};
+
+    /* 批量发送显示开启命令。 */
+    return Oled_DriverWriteCommandBuffer(display_on_commands,
+        (uint16_t)sizeof(display_on_commands));
 }
 
 /**
@@ -504,17 +567,24 @@ bool Oled_DriverDisplayOn(void)
  */
 bool Oled_DriverDisplayOff(void)
 {
-    /* 按 SSD1306 流程关闭电荷泵。 */
-    if (Oled_DriverWriteCommand(0x8DU) == false)
-    {
-        /* 命令失败。 */
-        return false;
-    }
-    if (Oled_DriverWriteCommand(0x10U) == false)
-    {
-        /* 参数失败。 */
-        return false;
-    }
-    /* 关闭显示。 */
-    return Oled_DriverWriteCommand(0xAEU);
+    /* 关闭电荷泵并关闭显示输出。 */
+    static const uint8_t display_off_commands[] = {0x8DU, 0x10U, 0xAEU};
+
+    /* 批量发送显示关闭命令。 */
+    return Oled_DriverWriteCommandBuffer(display_off_commands,
+        (uint16_t)sizeof(display_off_commands));
+}
+
+/**
+ * @brief  查询最近一次 OLED I2C 通信是否成功。
+ *
+ * @note   该状态用于应用层退避刷新。若 OLED 未接或地址错误，底层会在失败时清除此标志。
+ *
+ * @param  无。
+ * @return true 表示最近一次 OLED 访问成功；false 表示尚未成功或最近访问失败。
+ */
+bool Oled_DriverIsAvailable(void)
+{
+    /* 返回底层最近一次 I2C 写入结果。 */
+    return s_oled_driver_available;
 }

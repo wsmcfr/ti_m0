@@ -22,6 +22,30 @@ static const int16_t s_line_track_weights[LINE_TRACK_SENSOR_COUNT] =
 };
 
 #if !defined(LINE_TRACK_HOST_TEST)
+/* 灰度循迹完整快照的目标周期。任务本身 1ms 调度，但只按该周期启动一轮新采样。 */
+#define LINE_TRACK_APP_SAMPLE_PERIOD_MS     (20U)
+
+/* 每个调度切片最多做几次 ADC 单点采样，限制单次任务占用时间。 */
+#define LINE_TRACK_APP_SAMPLES_PER_SLICE    (2U)
+
+/* 每路累积采样次数。次数越高越稳，但完整快照跨越的调度周期越长。 */
+#define LINE_TRACK_APP_SAMPLES_PER_CHANNEL  (4U)
+
+/* 编译期约束：每个切片至少要采一次，避免状态机永远无法推进。 */
+typedef char line_track_slice_sample_check[
+    (LINE_TRACK_APP_SAMPLES_PER_SLICE > 0U) ? 1 : -1];
+
+/**
+ * @brief  灰度采样状态机阶段。
+ *
+ * @note   IDLE 表示等待下一个 20ms 周期；SAMPLING 表示正在跨多个 1ms 切片采完整 8 路。
+ */
+typedef enum
+{
+    LINE_TRACK_SAMPLE_STATE_IDLE = 0,     /* 未在采样，等待下一轮启动。 */
+    LINE_TRACK_SAMPLE_STATE_SAMPLING      /* 正在分片采集 8 路灰度数据。 */
+} line_track_sample_state_t;
+
 /* 应用层保存的校准范围，默认会随着任务持续更新到当前环境范围。 */
 static line_track_calibration_t s_line_track_calibration;
 
@@ -33,6 +57,30 @@ static uint16_t s_line_track_threshold = LINE_TRACK_DEFAULT_THRESHOLD;
 
 /* true 表示周期任务会继续更新校准 min/max，适合上电初期或人工重新标定。 */
 static bool s_line_track_calibrating = true;
+
+/* 当前采样状态机阶段，避免一次任务阻塞读完 8 路。 */
+static line_track_sample_state_t s_line_track_sample_state =
+    LINE_TRACK_SAMPLE_STATE_IDLE;
+
+/* 最近一次启动完整灰度采样帧的系统 tick。 */
+static uint32_t s_line_track_last_sample_start_ms = 0U;
+
+/* 当前正在采集的物理通道号，0~7。 */
+static uint8_t s_line_track_active_channel = 0U;
+
+/* 当前物理通道已经完成的单点采样次数。 */
+static uint8_t s_line_track_channel_sample_count = 0U;
+
+/* 当前物理通道单点采样累加和，用于完成后求平均。 */
+static uint32_t s_line_track_channel_sum = 0U;
+
+/* 一轮完整 8 路采样的原始值工作缓冲，完成后再提交到最新快照。 */
+static uint16_t s_line_track_raw_work[LINE_TRACK_SENSOR_COUNT];
+
+static void LineTrack_AppResetSampleState(void);
+static void LineTrack_AppPublishRawSample(const uint16_t *raw);
+static void LineTrack_AppStartSampleFrame(uint32_t now_ms);
+static void LineTrack_AppProcessSampleSlice(uint32_t now_ms);
 #endif
 
 /**
@@ -368,45 +416,39 @@ int16_t LineTrack_CalculatePositionError(const uint8_t *binary,
 
 #if !defined(LINE_TRACK_HOST_TEST)
 /**
- * @brief  初始化灰度循迹应用层。
+ * @brief  复位灰度分片采样状态机。
  *
- * @note   SysConfig 已经完成 ADC/GPIO 基础配置；这里初始化驱动、校准结构和应用快照。
+ * @note   采样失败或重新初始化时调用本函数，丢弃当前未完成帧。
  *
  * @param  无。
  * @return 无。
  */
-void LineTrack_AppInit(void)
+static void LineTrack_AppResetSampleState(void)
 {
-    /* 初始化底层灰度驱动，确保地址线和 ADC/DMA 状态可用。 */
-    GraySensor_DriverInit();
-    /* 初始化校准范围，让上电后的采样逐步形成当前环境 min/max。 */
-    LineTrack_InitCalibration(&s_line_track_calibration);
-    /* 清空最新快照，避免上电后读取到未定义状态。 */
-    memset(&s_line_track_latest, 0, sizeof(s_line_track_latest));
-    /* 使用默认二值化阈值。 */
-    s_line_track_threshold = LINE_TRACK_DEFAULT_THRESHOLD;
-    /* 默认进入自动校准状态，便于传感器在启动后先建立范围。 */
-    s_line_track_calibrating = true;
+    /* 回到空闲阶段，等待下一个采样周期重新启动。 */
+    s_line_track_sample_state = LINE_TRACK_SAMPLE_STATE_IDLE;
+    /* 当前通道复位到 0，保证下一帧从物理第 0 路开始。 */
+    s_line_track_active_channel = 0U;
+    /* 清空当前通道已经采到的次数。 */
+    s_line_track_channel_sample_count = 0U;
+    /* 清空当前通道累加和，避免旧半帧影响下一轮。 */
+    s_line_track_channel_sum = 0U;
 }
 
 /**
- * @brief  灰度循迹周期任务。
+ * @brief  把一轮完整 8 路原始值提交到循迹快照。
  *
- * @note   任务读取 8 路灰度原始值，更新校准、归一化、二值化和位置误差。
- *         若底层本次采样失败，任务直接返回并保留上一快照。
+ * @note   只有完整帧采样成功后才更新快照；半帧失败会保留上一组有效数据。
  *
- * @param  无。
+ * @param  raw 完整 8 路原始 ADC 值数组。
  * @return 无。
  */
-void LineTrack_AppTask(void)
+static void LineTrack_AppPublishRawSample(const uint16_t *raw)
 {
-    /* 保存本次采样得到的 8 路 ADC 原始值。 */
-    uint16_t raw[LINE_TRACK_SENSOR_COUNT];
-
-    /* 从底层驱动读取一整组 8 路传感器值。 */
-    if (GraySensor_DriverReadAll(raw, (uint8_t)LINE_TRACK_SENSOR_COUNT) == false)
+    /* 原始值数组不能为空。 */
+    if (raw == NULL)
     {
-        /* 采样失败时不更新快照，保留上一组有效数据。 */
+        /* 无有效数据可提交。 */
         return;
     }
 
@@ -439,6 +481,190 @@ void LineTrack_AppTask(void)
     s_line_track_latest.last_update_ms = Scheduler_GetTick();
     /* 标记快照已经有效。 */
     s_line_track_latest.valid = true;
+}
+
+/**
+ * @brief  启动一轮新的 8 路灰度分片采样。
+ *
+ * @note   本函数只选择第 0 个物理通道，不做 ADC 读取；实际采样由后续切片推进。
+ *
+ * @param  now_ms 当前系统 tick，用于记录本轮启动时间。
+ * @return 无。
+ */
+static void LineTrack_AppStartSampleFrame(uint32_t now_ms)
+{
+    /* 清空工作缓冲，避免调试时看到上一轮残留。 */
+    memset(s_line_track_raw_work, 0, sizeof(s_line_track_raw_work));
+    /* 记录本轮采样启动时间，控制完整帧周期。 */
+    s_line_track_last_sample_start_ms = now_ms;
+    /* 从物理通道 0 开始采集，完成后按驱动参考方向映射到逻辑数组。 */
+    s_line_track_active_channel = 0U;
+    /* 当前通道尚未完成任何单点采样。 */
+    s_line_track_channel_sample_count = 0U;
+    /* 当前通道累加和从 0 开始。 */
+    s_line_track_channel_sum = 0U;
+
+    /* 先选通第 0 路；如果地址线设置失败，则放弃本轮，等待下一个周期重试。 */
+    if (GraySensor_DriverSelectChannel(s_line_track_active_channel) == false)
+    {
+        /* 通道选择异常时复位状态机，避免卡在采样阶段。 */
+        LineTrack_AppResetSampleState();
+        /* 结束本次启动。 */
+        return;
+    }
+
+    /* 进入分片采样阶段，后续每次任务只做少量 ADC 采样。 */
+    s_line_track_sample_state = LINE_TRACK_SAMPLE_STATE_SAMPLING;
+}
+
+/**
+ * @brief  推进灰度分片采样状态机。
+ *
+ * @note   每次调用最多执行 LINE_TRACK_APP_SAMPLES_PER_SLICE 次 ADC 单点采样。
+ *         完成 8 路后一次性更新循迹快照，并回到空闲状态。
+ *
+ * @param  now_ms 当前系统 tick，用于完成帧时保留时间上下文。
+ * @return 无。
+ */
+static void LineTrack_AppProcessSampleSlice(uint32_t now_ms)
+{
+    /* 本次任务已经执行的单点采样次数，用于限制单次任务耗时。 */
+    uint8_t slice_samples = 0U;
+
+    /* 当前不在采样阶段时无需推进。 */
+    if (s_line_track_sample_state != LINE_TRACK_SAMPLE_STATE_SAMPLING)
+    {
+        /* 没有采样工作可做。 */
+        return;
+    }
+
+    /* 在本调度切片内尽量推进，但不超过设定的单点采样次数上限。 */
+    while (slice_samples < LINE_TRACK_APP_SAMPLES_PER_SLICE)
+    {
+        /* 保存当前单点采样结果。 */
+        uint16_t sample = 0U;
+        /* 保存当前通道对应的逻辑输出索引，按参考例程 Direction=1 反向排列。 */
+        uint8_t output_index;
+
+        /* 执行当前已选通通道的一次 ADC 采样。 */
+        if (GraySensor_DriverSampleSelected(&sample) == false)
+        {
+            /* ADC/DMA 异常时丢弃当前半帧，避免输出半可信数据。 */
+            LineTrack_AppResetSampleState();
+            /* 本次切片结束。 */
+            return;
+        }
+
+        /* 累加当前通道的单点采样结果。 */
+        s_line_track_channel_sum += sample;
+        /* 记录当前通道已完成采样次数。 */
+        s_line_track_channel_sample_count++;
+        /* 本切片采样计数增加。 */
+        slice_samples++;
+
+        /* 当前通道还没达到平均次数时，本次切片结束或继续同通道采样。 */
+        if (s_line_track_channel_sample_count < LINE_TRACK_APP_SAMPLES_PER_CHANNEL)
+        {
+            /* 继续等待后续切片补齐该通道采样。 */
+            continue;
+        }
+
+        /* 当前物理通道采样完成，计算反向映射后的逻辑输出索引。 */
+        output_index = (uint8_t)((LINE_TRACK_SENSOR_COUNT - 1U) -
+            s_line_track_active_channel);
+        /* 写入该路平均值。 */
+        s_line_track_raw_work[output_index] =
+            (uint16_t)(s_line_track_channel_sum / LINE_TRACK_APP_SAMPLES_PER_CHANNEL);
+
+        /* 切到下一个物理通道前，清空当前通道计数和累加和。 */
+        s_line_track_channel_sample_count = 0U;
+        /* 清空累加和，准备下一路。 */
+        s_line_track_channel_sum = 0U;
+        /* 移动到下一个物理通道。 */
+        s_line_track_active_channel++;
+
+        /* 如果 8 个物理通道都完成，提交完整快照并结束本轮采样。 */
+        if (s_line_track_active_channel >= LINE_TRACK_SENSOR_COUNT)
+        {
+            /* 使用完整工作缓冲更新业务快照。 */
+            LineTrack_AppPublishRawSample(s_line_track_raw_work);
+            /* 采样帧已经结束，回到空闲阶段等待下一个 20ms 周期。 */
+            LineTrack_AppResetSampleState();
+            /* 本轮已完成，不再继续本切片。 */
+            return;
+        }
+
+        /* 选通下一路物理通道；失败则放弃当前半帧。 */
+        if (GraySensor_DriverSelectChannel(s_line_track_active_channel) == false)
+        {
+            /* 地址线设置失败时复位状态机，等待下一周期重试。 */
+            LineTrack_AppResetSampleState();
+            /* 本次切片结束。 */
+            return;
+        }
+    }
+
+    /* 显式引用 now_ms，保留后续增加采样耗时统计的入口。 */
+    (void)now_ms;
+}
+
+/**
+ * @brief  初始化灰度循迹应用层。
+ *
+ * @note   SysConfig 已经完成 ADC/GPIO 基础配置；这里初始化驱动、校准结构和应用快照。
+ *
+ * @param  无。
+ * @return 无。
+ */
+void LineTrack_AppInit(void)
+{
+    /* 初始化底层灰度驱动，确保地址线和 ADC/DMA 状态可用。 */
+    GraySensor_DriverInit();
+    /* 初始化校准范围，让上电后的采样逐步形成当前环境 min/max。 */
+    LineTrack_InitCalibration(&s_line_track_calibration);
+    /* 清空最新快照，避免上电后读取到未定义状态。 */
+    memset(&s_line_track_latest, 0, sizeof(s_line_track_latest));
+    /* 使用默认二值化阈值。 */
+    s_line_track_threshold = LINE_TRACK_DEFAULT_THRESHOLD;
+    /* 默认进入自动校准状态，便于传感器在启动后先建立范围。 */
+    s_line_track_calibrating = true;
+    /* 记录当前 tick，让第一轮采样按完整周期启动。 */
+    s_line_track_last_sample_start_ms = Scheduler_GetTick();
+    /* 复位分片采样状态机，确保上电后没有半帧残留。 */
+    LineTrack_AppResetSampleState();
+}
+
+/**
+ * @brief  灰度循迹周期任务。
+ *
+ * @note   任务读取 8 路灰度原始值，更新校准、归一化、二值化和位置误差。
+ *         若底层本次采样失败，任务直接返回并保留上一快照。
+ *
+ * @param  无。
+ * @return 无。
+ */
+void LineTrack_AppTask(void)
+{
+    /* 读取当前系统 tick，用于周期判断和状态机推进。 */
+    uint32_t now_ms = Scheduler_GetTick();
+
+    /* 空闲阶段只在到达目标周期后启动新一轮完整采样。 */
+    if (s_line_track_sample_state == LINE_TRACK_SAMPLE_STATE_IDLE)
+    {
+        /* 未到采样周期时直接返回，避免空转访问 ADC。 */
+        if ((uint32_t)(now_ms - s_line_track_last_sample_start_ms) <
+            LINE_TRACK_APP_SAMPLE_PERIOD_MS)
+        {
+            /* 采样周期未到。 */
+            return;
+        }
+
+        /* 到达周期后只启动采样帧，不在同一次任务里读完整 8 路。 */
+        LineTrack_AppStartSampleFrame(now_ms);
+    }
+
+    /* 推进本轮采样，每次任务只做受限次数的 ADC 单点采样。 */
+    LineTrack_AppProcessSampleSlice(now_ms);
 }
 
 /**

@@ -64,6 +64,36 @@ bool Uart_AppSendToPc(const uint8_t *data, uint16_t length)
 }
 
 /**
+ * @brief  尝试通过电脑串口 UART0 发送一段数据，端口忙时立即返回。
+ *
+ * @note   该接口用于周期任务里的调试输出，避免日志等待 DMA/EOT 完成而拖慢调度。
+ *         调用者必须保证 data 缓冲在发送完成前保持有效且内容不被改写。
+ *
+ * @param  data   待发送数据地址。
+ * @param  length 待发送字节数。
+ * @return true 表示已经启动发送；false 表示参数错误或串口忙。
+ */
+bool Uart_AppTrySendToPc(const uint8_t *data, uint16_t length)
+{
+    /* 把非阻塞发送请求转交给驱动层 UART0/PC 端口。 */
+    return Uart_DriverTryWrite(UART_DRIVER_PORT_PC, data, length);
+}
+
+/**
+ * @brief  查询电脑串口 UART0 是否正在发送。
+ *
+ * @note   非阻塞日志在写静态格式化缓冲前使用该状态，避免覆盖 DMA 正在读取的数据。
+ *
+ * @param  无。
+ * @return true 表示 UART0 正在发送；false 表示可尝试提交新日志。
+ */
+bool Uart_AppIsPcTxBusy(void)
+{
+    /* 直接转发驱动层 UART0 TX 忙状态。 */
+    return Uart_DriverIsTxBusy(UART_DRIVER_PORT_PC);
+}
+
+/**
  * @brief  通过陀螺仪串口 UART1 发送一段数据。
  *
  * @note   陀螺仪配置命令都是 5 字节，本接口仍保留 length 参数，方便后续扩展。
@@ -214,6 +244,73 @@ int my_printf(const char *format, ...)
     }
 
     /* 返回本次实际尝试发送的字符数。 */
+    return length;
+}
+
+/**
+ * @brief  格式化字符串并尝试通过电脑串口 UART0 非阻塞输出。
+ *
+ * @note   本函数适合调度器周期任务调用：如果 UART0 正忙会立即返回 -1。
+ *         内部使用独立静态缓冲，只有上一次非阻塞日志发送完成后才会改写它，
+ *         避免 DMA 尚未完成时缓冲内容被下一条日志覆盖。
+ *
+ * @param  format printf 风格格式字符串。
+ * @param  ...    可变参数。
+ * @return 成功启动发送时返回发送字节数；格式化失败或串口忙时返回负数。
+ */
+int my_printf_try(const char *format, ...)
+{
+    /* 非阻塞输出专用静态缓冲，发送期间由 DMA 直接读取，不能与阻塞 my_printf 共用。 */
+    static char print_buffer[UART_APP_PRINTF_BUFFER_SIZE];
+    /* 保存可变参数列表，供 vsnprintf 读取。 */
+    va_list args;
+    /* 保存格式化后的字符串长度或错误码。 */
+    int length;
+
+    /* 格式字符串为空时无法格式化，直接返回错误。 */
+    if (format == NULL)
+    {
+        /* 返回负数表示格式化/发送失败。 */
+        return -1;
+    }
+
+    /* 如果上一条非阻塞日志仍在发送，不能改写静态缓冲，直接丢弃本条日志。 */
+    if (Uart_AppIsPcTxBusy() == true)
+    {
+        /* 返回负数表示本条日志未提交。 */
+        return -1;
+    }
+
+    va_start(args, format);
+    /* 将格式化结果写入非阻塞专用静态缓冲。 */
+    length = vsnprintf(print_buffer, sizeof(print_buffer), format, args);
+    /* 结束可变参数读取，释放 va_list 相关状态。 */
+    va_end(args);
+
+    /* vsnprintf 返回负数表示格式化失败。 */
+    if (length < 0)
+    {
+        /* 格式化失败时返回错误。 */
+        return -1;
+    }
+
+    /* 如果返回长度大于等于缓冲区大小，说明输出被截断。 */
+    if ((uint32_t)length >= sizeof(print_buffer))
+    {
+        /*
+         * 只发送缓冲区里已经存在的有效字符，避免把末尾 '\0' 或未定义内容发出去。
+         */
+        length = (int)sizeof(print_buffer) - 1;
+    }
+
+    /* 尝试启动 UART0 非阻塞 DMA 发送，端口忙时立即失败。 */
+    if (Uart_AppTrySendToPc((const uint8_t *)print_buffer, (uint16_t)length) == false)
+    {
+        /* 串口忙或参数异常时返回负数，调用者可选择丢弃本条日志。 */
+        return -1;
+    }
+
+    /* 返回本次实际提交给 UART 的字符数。 */
     return length;
 }
 

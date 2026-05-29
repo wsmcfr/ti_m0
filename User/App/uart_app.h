@@ -21,6 +21,8 @@ extern "C" {
 void Uart_AppInit(void);
 void Uart_AppTask(void);
 bool Uart_AppSendToPc(const uint8_t *data, uint16_t length);
+bool Uart_AppTrySendToPc(const uint8_t *data, uint16_t length);
+bool Uart_AppIsPcTxBusy(void);
 bool Uart_AppSendToGyro(const uint8_t *data, uint16_t length);
 bool Uart_AppSendToMotor(const uint8_t *data, uint16_t length);
 uint16_t Uart_AppReadPcPacket(uint8_t *out_data, uint16_t max_length);
@@ -28,6 +30,7 @@ uint16_t Uart_AppReadGyroPacket(uint8_t *out_data, uint16_t max_length);
 uint16_t Uart_AppReadMotorPacket(uint8_t *out_data, uint16_t max_length);
 void Uart_AppGetStats(uart_driver_port_t port, uart_driver_stats_t *out_stats);
 int my_printf(const char *format, ...);
+int my_printf_try(const char *format, ...);
 
 #ifdef __cplusplus
 }

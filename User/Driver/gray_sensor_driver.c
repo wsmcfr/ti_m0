@@ -207,6 +207,36 @@ bool GraySensor_DriverSelectChannel(uint8_t channel)
 }
 
 /**
+ * @brief  读取当前已选通灰度通道的一次 ADC 原始值。
+ *
+ * @note   本函数不切换地址线，只触发一次 ADC/DMA 单点采样。
+ *         App 层可先调用 GraySensor_DriverSelectChannel()，再分多次调度调用本函数，
+ *         从而把一整组采样拆散到多个主循环周期中。
+ *
+ * @param  out_value 输出单次 ADC 值。
+ * @return true 表示采样成功；false 表示参数错误或 ADC/DMA 超时。
+ */
+bool GraySensor_DriverSampleSelected(uint16_t *out_value)
+{
+    /* 输出指针不能为空。 */
+    if (out_value == NULL)
+    {
+        /* 参数错误时无法写出结果。 */
+        return false;
+    }
+
+    /* 如果上层未显式初始化，先补一次驱动初始化。 */
+    if (s_gray_driver_initialized == false)
+    {
+        /* 确保 DMA 地址和默认地址线状态有效。 */
+        GraySensor_DriverInit();
+    }
+
+    /* 只采样当前地址线选中的通道，不额外改变通道状态。 */
+    return GraySensor_DriverSampleOnce(out_value);
+}
+
+/**
  * @brief  读取单路灰度传感器 ADC 平均值。
  *
  * @note   先选通目标通道，再连续采样 GRAY_SENSOR_SAMPLE_COUNT 次并求平均。

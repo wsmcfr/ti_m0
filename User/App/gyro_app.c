@@ -232,8 +232,11 @@ static void Gyro_AppPrintLatestIfDue(void)
         yaw_abs = (uint32_t)yaw_milli;
     }
 
-    /* 通过 PC 串口输出一行 CSV 风格数据，便于串口助手或上位机读取。 */
-    (void)my_printf("GYRO,wz=%s%lu.%03lu,yaw=%s%lu.%03lu\r\n",
+    /*
+     * 通过 PC 串口输出一行 CSV 风格数据，便于串口助手或上位机读取。
+     * 周期任务使用非阻塞日志接口；UART0 正忙时直接丢弃本条日志，避免影响传感器解析。
+     */
+    (void)my_printf_try("GYRO,wz=%s%lu.%03lu,yaw=%s%lu.%03lu\r\n",
         /* 输出角速度符号字符串。 */
         wz_sign,
         /* 输出角速度整数部分，毫单位除以 1000 得到原单位整数。 */

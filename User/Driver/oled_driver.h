@@ -22,7 +22,9 @@ extern "C" {
 
 void Oled_DriverInit(void);
 bool Oled_DriverWriteCommand(uint8_t command);
+bool Oled_DriverWriteCommandBuffer(const uint8_t *commands, uint16_t length);
 bool Oled_DriverWriteData(uint8_t data);
+bool Oled_DriverWriteDataBuffer(const uint8_t *data, uint16_t length);
 bool Oled_DriverClear(void);
 bool Oled_DriverSetPosition(uint8_t x, uint8_t page);
 bool Oled_DriverShowChar(uint8_t x, uint8_t page, char ch);
@@ -30,6 +32,7 @@ bool Oled_DriverShowString(uint8_t x, uint8_t page, const char *text);
 bool Oled_DriverShowSignedNumber(uint8_t x, uint8_t page, int32_t value, uint8_t width);
 bool Oled_DriverDisplayOn(void);
 bool Oled_DriverDisplayOff(void);
+bool Oled_DriverIsAvailable(void);
 
 #ifdef __cplusplus
 }
