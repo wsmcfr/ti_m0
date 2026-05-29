@@ -41,8 +41,11 @@ typedef struct
 {
     uint32_t run_count;          /* 任务已经被调度执行的次数。 */
     uint32_t overrun_count;      /* 任务单次耗时大于等于自身周期的次数。 */
+    uint32_t missed_deadline_count; /* 任务迟到时被跳过的周期累计数量。 */
     uint32_t max_runtime_ms;     /* 观察到的最大单次运行耗时。 */
     uint32_t last_runtime_ms;    /* 最近一次运行耗时。 */
+    uint32_t max_lateness_ms;    /* 观察到的最大调度迟到时间。 */
+    uint32_t last_lateness_ms;   /* 最近一次调度迟到时间。 */
     uint32_t last_start_ms;      /* 最近一次开始运行的 tick。 */
 } scheduler_task_stats_t;
 

@@ -159,8 +159,8 @@ static void test_realtime_tasks_run_before_low_priority_tasks(void)
     uwTick = 0U;
     Scheduler_Init();
 
-    /* 推进到所有 1ms/5ms/20ms/100ms/150ms 任务都到期，便于一次扫描验证完整顺序。 */
-    uwTick = 150U;
+    /* 推进到所有 1ms/5ms/20ms/100ms/250ms 任务都到期，便于一次扫描验证完整顺序。 */
+    uwTick = 250U;
     Scheduler_Run();
 
     assert(s_call_count == 7U);
@@ -179,7 +179,7 @@ static void test_realtime_tasks_run_before_low_priority_tasks(void)
  * @param  无。
  * @return 无。
  */
-static void test_deadline_schedule_catches_up_after_overrun(void)
+static void test_scheduler_skips_backlog_after_overrun(void)
 {
     scheduler_task_stats_t stats;
 
@@ -190,20 +190,57 @@ static void test_deadline_schedule_catches_up_after_overrun(void)
     /* 灰度循迹任务模拟耗时 3ms，超过自身 1ms 周期。 */
     s_task_cost_ms[SCHEDULER_TASK_ID_LINE_TRACK] = 3U;
 
-    /* 第一次到期运行后，deadline 应该只前进一个周期，而不是被重置到结束时刻。 */
+    /* 第一次到期运行后，任务耗时超过周期。 */
     uwTick = 1U;
     Scheduler_Run();
     assert(s_call_count >= 1U);
     assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
 
-    /* 当前 tick 已被桩任务推进到 4ms；下一次扫描应立即再次运行灰度任务。 */
+    /*
+     * 当前 tick 已被桩任务推进到 4ms。
+     * 新策略只补偿一次并跳过积压周期，不能立刻再次运行 1ms 任务，
+     * 否则高频任务会把后续低频任务长期饿住。
+     */
     s_call_count = 0U;
     Scheduler_Run();
-    assert(s_call_count >= 1U);
-    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
+    assert(s_call_count == 0U);
 
     assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
-    assert(stats.run_count == 2UL);
+    assert(stats.run_count == 1UL);
+    assert(stats.overrun_count == 1UL);
+    assert(stats.last_lateness_ms == 0UL);
+    assert(stats.max_lateness_ms == 0UL);
+    assert(stats.missed_deadline_count == 0UL);
+}
+
+/**
+ * @brief  验证长时间延迟后只执行一次任务，并记录迟到和跳过周期。
+ *
+ * @param  无。
+ * @return 无。
+ */
+static void test_scheduler_records_lateness_and_missed_periods(void)
+{
+    scheduler_task_stats_t stats;
+
+    SchedulerTest_ResetStubs();
+    uwTick = 0U;
+    Scheduler_Init();
+
+    /*
+     * 灰度循迹任务原 deadline 为 1ms。直接推进到 150ms 后运行，
+     * 调度器应只调用一次该任务，并统计 149ms 迟到与 149 个被跳过周期。
+     */
+    uwTick = 150U;
+    Scheduler_Run();
+
+    assert(s_call_count >= 1U);
+    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
+    assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
+    assert(stats.run_count == 1UL);
+    assert(stats.last_lateness_ms == 149UL);
+    assert(stats.max_lateness_ms == 149UL);
+    assert(stats.missed_deadline_count == 149UL);
 }
 
 /**
@@ -230,6 +267,9 @@ static void test_scheduler_records_runtime_and_overrun_stats(void)
     assert(stats.max_runtime_ms == 3UL);
     assert(stats.last_runtime_ms == 3UL);
     assert(stats.overrun_count == 1UL);
+    assert(stats.last_lateness_ms == 0UL);
+    assert(stats.max_lateness_ms == 0UL);
+    assert(stats.missed_deadline_count == 0UL);
 
     Scheduler_ClearTaskStats(SCHEDULER_TASK_ID_LINE_TRACK);
     assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
@@ -237,6 +277,9 @@ static void test_scheduler_records_runtime_and_overrun_stats(void)
     assert(stats.max_runtime_ms == 0UL);
     assert(stats.last_runtime_ms == 0UL);
     assert(stats.overrun_count == 0UL);
+    assert(stats.last_lateness_ms == 0UL);
+    assert(stats.max_lateness_ms == 0UL);
+    assert(stats.missed_deadline_count == 0UL);
 }
 
 /**
@@ -248,7 +291,8 @@ static void test_scheduler_records_runtime_and_overrun_stats(void)
 int main(void)
 {
     test_realtime_tasks_run_before_low_priority_tasks();
-    test_deadline_schedule_catches_up_after_overrun();
+    test_scheduler_skips_backlog_after_overrun();
+    test_scheduler_records_lateness_and_missed_periods();
     test_scheduler_records_runtime_and_overrun_stats();
 
     printf("scheduler tests passed\n");

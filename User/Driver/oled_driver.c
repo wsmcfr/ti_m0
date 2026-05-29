@@ -21,8 +21,8 @@
 /* SSD1306 控制字节：后续字节解释为显示数据。 */
 #define OLED_DRIVER_CONTROL_DATA        (0x40U)
 
-/* I2C 有界等待计数，避免 OLED 未连接时永久阻塞。 */
-#define OLED_DRIVER_I2C_TIMEOUT         (120000UL)
+/* I2C 有界等待计数，避免 OLED 未连接时长时间阻塞调度器。 */
+#define OLED_DRIVER_I2C_TIMEOUT         (30000UL)
 
 /* 6x8 ASCII 字库覆盖 0x20~0x7E，一共 95 个可打印字符。 */
 #define OLED_DRIVER_FONT_CHAR_COUNT     (95U)
@@ -155,7 +155,7 @@ static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t
         DL_I2C_CONTROLLER_DIRECTION_TX, (uint16_t)(length + 1U));
 
     /* 等待传输完成，同时在 FIFO 有空间时继续填剩余 payload。 */
-    wait_count = OLED_DRIVER_I2C_TIMEOUT + ((uint32_t)length * 2000UL);
+    wait_count = OLED_DRIVER_I2C_TIMEOUT + ((uint32_t)length * 500UL);
     while (((DL_I2C_getControllerStatus(I2C_OLED_INST) &
                 DL_I2C_CONTROLLER_STATUS_BUSY) != 0U) &&
            (wait_count > 0UL))

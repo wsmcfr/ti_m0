@@ -17,10 +17,10 @@
 #include "oled_driver.h"
 
 /* OLED 正常刷新间隔。显示状态不需要高频刷新，降低 I2C 占用。 */
-#define OLED_APP_REFRESH_INTERVAL_TICKS     (10U)
+#define OLED_APP_REFRESH_INTERVAL_TICKS     (4U)
 
 /* OLED 连续失败后的退避任务次数，避免未接屏时每轮都进入较长 I2C 超时。 */
-#define OLED_APP_ERROR_BACKOFF_TICKS        (50U)
+#define OLED_APP_ERROR_BACKOFF_TICKS        (120U)
 
 /* 低频刷新分片计数，每次任务只刷一行，避免单次任务写太多 I2C 字节。 */
 static uint8_t s_oled_refresh_slice = 0U;

@@ -18,24 +18,25 @@
 /* 调度器依赖的全局毫秒 tick，由 SysTick_Handler() 调用 Scheduler_TickInc() 递增。 */
 volatile uint32_t uwTick = 0U;
 
-/* 当前任务表中的任务数量，初始化时根据数组长度计算，避免手工维护数量出错。 */
-static uint8_t Task_Num = 0U;
-
 /* 任务表：按实时性从高到低排列，避免低优先级显示或心跳任务排在关键控制任务前面。 */
 static task_t Scheduler_Task[] =
 {
-    { SCHEDULER_TASK_ID_LINE_TRACK, LineTrack_AppTask, 1U, 0U, {0U, 0U, 0U, 0U, 0U} },
-    { SCHEDULER_TASK_ID_GYRO, Gyro_AppTask, 5U, 0U, {0U, 0U, 0U, 0U, 0U} },
-    { SCHEDULER_TASK_ID_MOTOR, Motor_AppTask, 5U, 0U, {0U, 0U, 0U, 0U, 0U} },
-    { SCHEDULER_TASK_ID_KEY, Key_AppTask, 5U, 0U, {0U, 0U, 0U, 0U, 0U} },
-    { SCHEDULER_TASK_ID_UART, Uart_AppTask, 20U, 0U, {0U, 0U, 0U, 0U, 0U} },
-    { SCHEDULER_TASK_ID_OLED, Oled_AppTask, 150U, 0U, {0U, 0U, 0U, 0U, 0U} },
-    { SCHEDULER_TASK_ID_LED, Led_AppTask, 100U, 0U, {0U, 0U, 0U, 0U, 0U} },
+    { SCHEDULER_TASK_ID_LINE_TRACK, LineTrack_AppTask, 1U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_GYRO, Gyro_AppTask, 5U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_MOTOR, Motor_AppTask, 5U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_KEY, Key_AppTask, 5U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_UART, Uart_AppTask, 20U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_OLED, Oled_AppTask, 250U, 0U, {0U} },
+    { SCHEDULER_TASK_ID_LED, Led_AppTask, 100U, 0U, {0U} },
 };
+
+/* 当前任务表中的任务数量由数组长度生成，编译期固定，避免运行期重复赋值。 */
+#define SCHEDULER_TASK_COUNT    ((uint8_t)(sizeof(Scheduler_Task) / sizeof(Scheduler_Task[0])))
 
 static task_t *Scheduler_FindTaskById(scheduler_task_id_t task_id);
 static bool Scheduler_IsDeadlineReached(uint32_t now_time, uint32_t deadline_ms);
 static void Scheduler_UpdateTaskDeadline(task_t *task, uint32_t now_time);
+static void Scheduler_RecordTaskLateness(task_t *task, uint32_t lateness_ms);
 static void Scheduler_RecordTaskRuntime(task_t *task, uint32_t start_time, uint32_t end_time);
 
 /**
@@ -52,11 +53,8 @@ void Scheduler_Init(void)
     /* 读取当前系统毫秒 tick，作为所有任务的统一启动时间基准。 */
     uint32_t now_time = Scheduler_GetTick();
 
-    /* 根据静态任务表的数组长度计算任务数量，避免手写数量和数组内容不一致。 */
-    Task_Num = (uint8_t)(sizeof(Scheduler_Task) / sizeof(Scheduler_Task[0]));
-
     /* 逐个遍历任务表，为每个任务写入初始调度时间戳。 */
-    for (uint8_t i = 0U; i < Task_Num; i++)
+    for (uint8_t i = 0U; i < SCHEDULER_TASK_COUNT; i++)
     {
         /*
          * 记录任务第一次到期时间，而不是上次运行时间。
@@ -66,8 +64,11 @@ void Scheduler_Init(void)
         /* 初始化时清空统计，保证每次 System_Init() 后统计都从零开始。 */
         Scheduler_Task[i].stats.run_count = 0U;
         Scheduler_Task[i].stats.overrun_count = 0U;
+        Scheduler_Task[i].stats.missed_deadline_count = 0U;
         Scheduler_Task[i].stats.max_runtime_ms = 0U;
         Scheduler_Task[i].stats.last_runtime_ms = 0U;
+        Scheduler_Task[i].stats.max_lateness_ms = 0U;
+        Scheduler_Task[i].stats.last_lateness_ms = 0U;
         Scheduler_Task[i].stats.last_start_ms = 0U;
     }
 }
@@ -90,7 +91,7 @@ static task_t *Scheduler_FindTaskById(scheduler_task_id_t task_id)
     }
 
     /* 遍历当前任务表，找到 ID 完全匹配的任务项。 */
-    for (uint8_t i = 0U; i < Task_Num; i++)
+    for (uint8_t i = 0U; i < SCHEDULER_TASK_COUNT; i++)
     {
         /* 任务 ID 匹配时返回该任务项地址。 */
         if (Scheduler_Task[i].task_id == task_id)
@@ -126,9 +127,9 @@ static bool Scheduler_IsDeadlineReached(uint32_t now_time, uint32_t deadline_ms)
 /**
  * @brief  推进任务下一次到期时间。
  *
- * @note   每次任务运行只至少推进一个周期；如果当前 tick 已经落后多个周期，
- *         则循环追赶到未来 deadline。这样不会把周期基准重置到任务结束时刻，
- *         能减少长期漂移，同时避免同一次 Scheduler_Run() 内连续执行同一任务。
+ * @note   当前工程优先保证主循环公平性：任务迟到后只执行一次，不把历史积压周期
+ *         逐个补跑。下一次 deadline 从本次任务结束时刻重新排到未来，避免高频任务
+ *         因为长阻塞或自身超期而在后续 Scheduler_Run() 中连续抢占其它任务。
  *
  * @param  task     需要更新的任务。
  * @param  now_time 本次判定到期时的 tick。
@@ -143,15 +144,44 @@ static void Scheduler_UpdateTaskDeadline(task_t *task, uint32_t now_time)
         return;
     }
 
-    /*
-     * 先推进一个周期，确保当前到期事件被消费。
-     * 后续循环只负责处理已经严重落后的情况，避免 deadline 永远停留在过去。
-     */
-    task->deadline_ms += task->interval_time_ms;
-    while (Scheduler_IsDeadlineReached(now_time, task->deadline_ms) == true)
+    /* 从本次任务结束时刻重新安排下一次到期时间，只补偿一次，不补跑历史周期。 */
+    task->deadline_ms = now_time + task->interval_time_ms;
+}
+
+/**
+ * @brief  记录一次任务调度迟到信息。
+ *
+ * @note   lateness_ms 表示当前任务实际开始判定时已经晚于 deadline 的时间。
+ *         missed_deadline_count 记录被跳过的完整周期数，用于定位长期被阻塞的任务。
+ *
+ * @param  task        已到期的任务。
+ * @param  lateness_ms 本次调度迟到时间，单位 ms。
+ * @return 无。
+ */
+static void Scheduler_RecordTaskLateness(task_t *task, uint32_t lateness_ms)
+{
+    /* 空任务无法记录统计。 */
+    if (task == NULL)
     {
-        /* 如果当前时间仍然不早于 deadline，继续追赶一个周期。 */
-        task->deadline_ms += task->interval_time_ms;
+        /* 参数无效。 */
+        return;
+    }
+
+    /* 保存最近一次迟到时间，便于实时观察本轮调度是否被前序任务拖慢。 */
+    task->stats.last_lateness_ms = lateness_ms;
+
+    /* 更新最大迟到时间，用于评估最坏调度响应。 */
+    if (lateness_ms > task->stats.max_lateness_ms)
+    {
+        /* 当前迟到时间刷新了历史最大值。 */
+        task->stats.max_lateness_ms = lateness_ms;
+    }
+
+    /* 迟到达到一个或多个完整周期时，累计这些被跳过的历史周期。 */
+    if ((lateness_ms > 0U) && (task->interval_time_ms > 0U))
+    {
+        /* 只统计完整周期数量，不把亚周期级迟到记为漏周期。 */
+        task->stats.missed_deadline_count += (lateness_ms / task->interval_time_ms);
     }
 }
 
@@ -214,7 +244,7 @@ static void Scheduler_RecordTaskRuntime(task_t *task, uint32_t start_time, uint3
 void Scheduler_Run(void)
 {
     /* 从任务表第 0 项开始逐项扫描，直到处理完当前登记的全部任务。 */
-    for (uint8_t i = 0U; i < Task_Num; i++)
+    for (uint8_t i = 0U; i < SCHEDULER_TASK_COUNT; i++)
     {
         /* 每处理一个任务前读取当前 tick，减少任务间等待造成的时间误差。 */
         uint32_t now_time = Scheduler_GetTick();
@@ -231,14 +261,20 @@ void Scheduler_Run(void)
         /* 到达任务周期后更新时间戳，再调用任务，避免任务耗时影响下一次基准。 */
         if (Scheduler_IsDeadlineReached(now_time, task->deadline_ms) == true)
         {
+            /* 保存相对任务 deadline 的迟到时间，0 表示刚好到期或未迟到。 */
+            uint32_t lateness_ms = (uint32_t)(now_time - task->deadline_ms);
             /* 保存任务开始时间，用于统计本次任务运行耗时。 */
             uint32_t start_time = Scheduler_GetTick();
-            /* 先推进下一次 deadline，避免任务内部耗时直接拖动周期基准。 */
-            Scheduler_UpdateTaskDeadline(task, now_time);
+            /* 记录本次任务调度迟到和被跳过的历史周期。 */
+            Scheduler_RecordTaskLateness(task, lateness_ms);
             /* 调用当前任务函数，实际业务逻辑由 App 层函数完成。 */
             task->run_task();
             /* 记录任务结束后的 tick，用于计算毫秒级运行耗时。 */
-            Scheduler_RecordTaskRuntime(task, start_time, Scheduler_GetTick());
+            now_time = Scheduler_GetTick();
+            /* 任务结束后只安排下一次未来 deadline，不补跑历史积压周期。 */
+            Scheduler_UpdateTaskDeadline(task, now_time);
+            /* 记录任务运行耗时，用于定位长阻塞任务。 */
+            Scheduler_RecordTaskRuntime(task, start_time, now_time);
         }
     }
 }
@@ -317,8 +353,11 @@ void Scheduler_ClearTaskStats(scheduler_task_id_t task_id)
     /* 逐项清零统计，避免引入 memset 依赖也便于后续字段扩展时显式维护。 */
     task->stats.run_count = 0U;
     task->stats.overrun_count = 0U;
+    task->stats.missed_deadline_count = 0U;
     task->stats.max_runtime_ms = 0U;
     task->stats.last_runtime_ms = 0U;
+    task->stats.max_lateness_ms = 0U;
+    task->stats.last_lateness_ms = 0U;
     task->stats.last_start_ms = 0U;
 }
 

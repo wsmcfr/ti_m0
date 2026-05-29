@@ -25,15 +25,11 @@ static const int16_t s_line_track_weights[LINE_TRACK_SENSOR_COUNT] =
 /* 灰度循迹完整快照的目标周期。任务本身 1ms 调度，但只按该周期启动一轮新采样。 */
 #define LINE_TRACK_APP_SAMPLE_PERIOD_MS     (20U)
 
-/* 每个调度切片最多做几次 ADC 单点采样，限制单次任务占用时间。 */
-#define LINE_TRACK_APP_SAMPLES_PER_SLICE    (2U)
-
 /* 每路累积采样次数。次数越高越稳，但完整快照跨越的调度周期越长。 */
-#define LINE_TRACK_APP_SAMPLES_PER_CHANNEL  (4U)
+#define LINE_TRACK_APP_SAMPLES_PER_CHANNEL  (2U)
 
-/* 编译期约束：每个切片至少要采一次，避免状态机永远无法推进。 */
-typedef char line_track_slice_sample_check[
-    (LINE_TRACK_APP_SAMPLES_PER_SLICE > 0U) ? 1 : -1];
+/* 单次 ADC/DMA 非阻塞采样的超时时间，超时后丢弃当前半帧并重启下一轮。 */
+#define LINE_TRACK_APP_SAMPLE_TIMEOUT_MS    (3U)
 
 /**
  * @brief  灰度采样状态机阶段。
@@ -74,12 +70,20 @@ static uint8_t s_line_track_channel_sample_count = 0U;
 /* 当前物理通道单点采样累加和，用于完成后求平均。 */
 static uint32_t s_line_track_channel_sum = 0U;
 
+/* true 表示当前通道已经启动一次 ADC/DMA 采样，等待后续任务轮询完成。 */
+static bool s_line_track_sample_pending = false;
+
+/* 当前挂起单点采样的启动 tick，用于检测 ADC/DMA 完成超时。 */
+static uint32_t s_line_track_sample_pending_start_ms = 0U;
+
 /* 一轮完整 8 路采样的原始值工作缓冲，完成后再提交到最新快照。 */
 static uint16_t s_line_track_raw_work[LINE_TRACK_SENSOR_COUNT];
 
 static void LineTrack_AppResetSampleState(void);
 static void LineTrack_AppPublishRawSample(const uint16_t *raw);
 static void LineTrack_AppStartSampleFrame(uint32_t now_ms);
+static bool LineTrack_AppStartPendingSample(uint32_t now_ms);
+static void LineTrack_AppCommitOneSample(uint16_t sample);
 static void LineTrack_AppProcessSampleSlice(uint32_t now_ms);
 #endif
 
@@ -433,6 +437,15 @@ static void LineTrack_AppResetSampleState(void)
     s_line_track_channel_sample_count = 0U;
     /* 清空当前通道累加和，避免旧半帧影响下一轮。 */
     s_line_track_channel_sum = 0U;
+    if (s_line_track_sample_pending == true)
+    {
+        /* 若存在未完成 ADC/DMA 采样，主动中止，避免旧结果污染下一轮状态机。 */
+        GraySensor_DriverAbortSampleSelected();
+    }
+    /* 清除挂起采样标志，下一次进入采样阶段会重新启动单点采样。 */
+    s_line_track_sample_pending = false;
+    /* 清空挂起采样开始时间。 */
+    s_line_track_sample_pending_start_ms = 0U;
 }
 
 /**
@@ -513,23 +526,121 @@ static void LineTrack_AppStartSampleFrame(uint32_t now_ms)
         return;
     }
 
-    /* 进入分片采样阶段，后续每次任务只做少量 ADC 采样。 */
+    /* 进入分片采样阶段，后续每次任务只推进一个非阻塞 ADC 采样状态。 */
     s_line_track_sample_state = LINE_TRACK_SAMPLE_STATE_SAMPLING;
+    /* 启动第 0 路的第一笔非阻塞采样，后续周期再轮询完成状态。 */
+    if (LineTrack_AppStartPendingSample(now_ms) == false)
+    {
+        /* 启动失败时丢弃本轮采样，等待下一个周期重试。 */
+        LineTrack_AppResetSampleState();
+    }
 }
 
 /**
- * @brief  推进灰度分片采样状态机。
+ * @brief  启动当前选中通道的一次非阻塞单点采样。
  *
- * @note   每次调用最多执行 LINE_TRACK_APP_SAMPLES_PER_SLICE 次 ADC 单点采样。
+ * @note   本函数只启动 ADC/DMA，不等待结果。调用者后续通过 Poll 查询完成状态。
+ *
+ * @param  now_ms 当前系统 tick，用于记录超时起点。
+ * @return true 表示采样已启动或已有采样挂起；false 表示启动失败。
+ */
+static bool LineTrack_AppStartPendingSample(uint32_t now_ms)
+{
+    /* 已有挂起采样时不重复启动，避免覆盖 ADC/DMA 状态。 */
+    if (s_line_track_sample_pending == true)
+    {
+        /* 当前采样仍待完成。 */
+        return true;
+    }
+
+    /* 启动当前已选中通道的一次 ADC/DMA 采样。 */
+    if (GraySensor_DriverStartSampleSelected() == false)
+    {
+        /* 底层拒绝启动时返回失败，让上层复位半帧。 */
+        return false;
+    }
+
+    /* 标记已有挂起采样，后续任务只轮询完成标志。 */
+    s_line_track_sample_pending = true;
+    /* 保存启动 tick，用于超时保护。 */
+    s_line_track_sample_pending_start_ms = now_ms;
+    /* 采样启动成功。 */
+    return true;
+}
+
+/**
+ * @brief  提交一个已完成的 ADC 单点样本，并在需要时切换通道或发布完整帧。
+ *
+ * @note   本函数只处理内存状态和 GPIO 选通，不启动下一笔 ADC 采样；启动动作由外层统一做。
+ *
+ * @param  sample 已完成的 ADC 单点样本。
+ * @return 无。
+ */
+static void LineTrack_AppCommitOneSample(uint16_t sample)
+{
+    /* 保存当前通道对应的逻辑输出索引，按参考例程 Direction=1 反向排列。 */
+    uint8_t output_index;
+
+    /* 累加当前通道的单点采样结果。 */
+    s_line_track_channel_sum += sample;
+    /* 记录当前通道已完成采样次数。 */
+    s_line_track_channel_sample_count++;
+
+    /* 当前通道还没达到平均次数时，等待后续单点采样继续累加。 */
+    if (s_line_track_channel_sample_count < LINE_TRACK_APP_SAMPLES_PER_CHANNEL)
+    {
+        /* 继续等待后续采样补齐该通道平均值。 */
+        return;
+    }
+
+    /* 当前物理通道采样完成，计算反向映射后的逻辑输出索引。 */
+    output_index = (uint8_t)((LINE_TRACK_SENSOR_COUNT - 1U) -
+        s_line_track_active_channel);
+    /* 写入该路平均值。 */
+    s_line_track_raw_work[output_index] =
+        (uint16_t)(s_line_track_channel_sum / LINE_TRACK_APP_SAMPLES_PER_CHANNEL);
+
+    /* 切到下一个物理通道前，清空当前通道计数和累加和。 */
+    s_line_track_channel_sample_count = 0U;
+    /* 清空累加和，准备下一路。 */
+    s_line_track_channel_sum = 0U;
+    /* 移动到下一个物理通道。 */
+    s_line_track_active_channel++;
+
+    /* 如果 8 个物理通道都完成，提交完整快照并结束本轮采样。 */
+    if (s_line_track_active_channel >= LINE_TRACK_SENSOR_COUNT)
+    {
+        /* 使用完整工作缓冲更新业务快照。 */
+        LineTrack_AppPublishRawSample(s_line_track_raw_work);
+        /* 采样帧已经结束，回到空闲阶段等待下一个 20ms 周期。 */
+        LineTrack_AppResetSampleState();
+        /* 本轮已完成。 */
+        return;
+    }
+
+    /* 选通下一路物理通道；失败则放弃当前半帧。 */
+    if (GraySensor_DriverSelectChannel(s_line_track_active_channel) == false)
+    {
+        /* 地址线设置失败时复位状态机，等待下一周期重试。 */
+        LineTrack_AppResetSampleState();
+    }
+}
+
+/**
+ * @brief  推进灰度非阻塞分片采样状态机。
+ *
+ * @note   每次调用最多处理一个完成样本或启动一个新样本，不在任务里等待 ADC 完成。
  *         完成 8 路后一次性更新循迹快照，并回到空闲状态。
  *
- * @param  now_ms 当前系统 tick，用于完成帧时保留时间上下文。
+ * @param  now_ms 当前系统 tick，用于检测 ADC/DMA 超时。
  * @return 无。
  */
 static void LineTrack_AppProcessSampleSlice(uint32_t now_ms)
 {
-    /* 本次任务已经执行的单点采样次数，用于限制单次任务耗时。 */
-    uint8_t slice_samples = 0U;
+    /* 保存非阻塞采样轮询状态。 */
+    gray_sensor_sample_status_t status;
+    /* 保存当前完成的单点采样结果。 */
+    uint16_t sample = 0U;
 
     /* 当前不在采样阶段时无需推进。 */
     if (s_line_track_sample_state != LINE_TRACK_SAMPLE_STATE_SAMPLING)
@@ -538,74 +649,57 @@ static void LineTrack_AppProcessSampleSlice(uint32_t now_ms)
         return;
     }
 
-    /* 在本调度切片内尽量推进，但不超过设定的单点采样次数上限。 */
-    while (slice_samples < LINE_TRACK_APP_SAMPLES_PER_SLICE)
+    /* 没有挂起采样时启动一笔并立即返回，避免在同一任务里启动后忙等。 */
+    if (s_line_track_sample_pending == false)
     {
-        /* 保存当前单点采样结果。 */
-        uint16_t sample = 0U;
-        /* 保存当前通道对应的逻辑输出索引，按参考例程 Direction=1 反向排列。 */
-        uint8_t output_index;
-
-        /* 执行当前已选通通道的一次 ADC 采样。 */
-        if (GraySensor_DriverSampleSelected(&sample) == false)
+        /* 启动失败时丢弃当前半帧。 */
+        if (LineTrack_AppStartPendingSample(now_ms) == false)
         {
-            /* ADC/DMA 异常时丢弃当前半帧，避免输出半可信数据。 */
+            /* 底层异常时复位状态机，等待下一轮周期重试。 */
             LineTrack_AppResetSampleState();
-            /* 本次切片结束。 */
-            return;
         }
-
-        /* 累加当前通道的单点采样结果。 */
-        s_line_track_channel_sum += sample;
-        /* 记录当前通道已完成采样次数。 */
-        s_line_track_channel_sample_count++;
-        /* 本切片采样计数增加。 */
-        slice_samples++;
-
-        /* 当前通道还没达到平均次数时，本次切片结束或继续同通道采样。 */
-        if (s_line_track_channel_sample_count < LINE_TRACK_APP_SAMPLES_PER_CHANNEL)
-        {
-            /* 继续等待后续切片补齐该通道采样。 */
-            continue;
-        }
-
-        /* 当前物理通道采样完成，计算反向映射后的逻辑输出索引。 */
-        output_index = (uint8_t)((LINE_TRACK_SENSOR_COUNT - 1U) -
-            s_line_track_active_channel);
-        /* 写入该路平均值。 */
-        s_line_track_raw_work[output_index] =
-            (uint16_t)(s_line_track_channel_sum / LINE_TRACK_APP_SAMPLES_PER_CHANNEL);
-
-        /* 切到下一个物理通道前，清空当前通道计数和累加和。 */
-        s_line_track_channel_sample_count = 0U;
-        /* 清空累加和，准备下一路。 */
-        s_line_track_channel_sum = 0U;
-        /* 移动到下一个物理通道。 */
-        s_line_track_active_channel++;
-
-        /* 如果 8 个物理通道都完成，提交完整快照并结束本轮采样。 */
-        if (s_line_track_active_channel >= LINE_TRACK_SENSOR_COUNT)
-        {
-            /* 使用完整工作缓冲更新业务快照。 */
-            LineTrack_AppPublishRawSample(s_line_track_raw_work);
-            /* 采样帧已经结束，回到空闲阶段等待下一个 20ms 周期。 */
-            LineTrack_AppResetSampleState();
-            /* 本轮已完成，不再继续本切片。 */
-            return;
-        }
-
-        /* 选通下一路物理通道；失败则放弃当前半帧。 */
-        if (GraySensor_DriverSelectChannel(s_line_track_active_channel) == false)
-        {
-            /* 地址线设置失败时复位状态机，等待下一周期重试。 */
-            LineTrack_AppResetSampleState();
-            /* 本次切片结束。 */
-            return;
-        }
+        /* 本次任务只负责启动采样。 */
+        return;
     }
 
-    /* 显式引用 now_ms，保留后续增加采样耗时统计的入口。 */
-    (void)now_ms;
+    /* 查询当前 ADC/DMA 采样是否完成。 */
+    status = GraySensor_DriverPollSampleSelected(&sample);
+    if (status == GRAY_SENSOR_SAMPLE_STATUS_BUSY)
+    {
+        /* 超过保护时间仍未完成时中止半帧，避免状态机永久卡住。 */
+        if ((uint32_t)(now_ms - s_line_track_sample_pending_start_ms) >=
+            LINE_TRACK_APP_SAMPLE_TIMEOUT_MS)
+        {
+            /* 复位应用层状态并中止底层采样，等待下一轮完整帧。 */
+            LineTrack_AppResetSampleState();
+        }
+        /* 未完成或已超时处理后均结束本次任务。 */
+        return;
+    }
+
+    /* 空闲或错误状态都表示本次挂起采样不可用，丢弃当前半帧。 */
+    if (status != GRAY_SENSOR_SAMPLE_STATUS_READY)
+    {
+        /* 复位状态，避免用半可信数据更新循迹快照。 */
+        LineTrack_AppResetSampleState();
+        return;
+    }
+
+    /* 当前挂起样本已取走，允许后续再次启动采样。 */
+    s_line_track_sample_pending = false;
+    /* 提交当前样本，可能完成通道、切换通道或发布整帧。 */
+    LineTrack_AppCommitOneSample(sample);
+
+    /* 如果还处于采样阶段，启动下一笔采样并在后续任务轮询结果。 */
+    if (s_line_track_sample_state == LINE_TRACK_SAMPLE_STATE_SAMPLING)
+    {
+        /* 启动失败时复位状态，等待下一帧周期重试。 */
+        if (LineTrack_AppStartPendingSample(now_ms) == false)
+        {
+            /* 底层异常导致无法继续采样。 */
+            LineTrack_AppResetSampleState();
+        }
+    }
 }
 
 /**

@@ -53,6 +53,156 @@ non-obvious branches.
 
 ---
 
+## Executable Runtime Contracts
+
+### Scheduler Deadline Contract
+
+Scope / trigger: use this contract when changing `User/scheduler.c`,
+`User/scheduler.h`, scheduler task intervals, or task runtime diagnostics.
+
+Signatures:
+
+```c
+void Scheduler_Run(void);
+bool Scheduler_GetTaskStats(scheduler_task_id_t task_id,
+    scheduler_task_stats_t *out_stats);
+void Scheduler_ClearTaskStats(scheduler_task_id_t task_id);
+```
+
+Contracts:
+
+- A task whose `deadline_ms` has passed is executed at most once during a single
+  `Scheduler_Run()` scan.
+- After a task returns, the next deadline is scheduled from the task end tick:
+  `deadline_ms = Scheduler_GetTick() + interval_time_ms`.
+- The scheduler must not replay every missed historical period after a long
+  blocking operation. Historical lateness is diagnostic data, not work debt.
+- `scheduler_task_stats_t.last_lateness_ms` records
+  `now_time - deadline_ms` for the most recent run.
+- `scheduler_task_stats_t.max_lateness_ms` records the maximum observed
+  lateness.
+- `scheduler_task_stats_t.missed_deadline_count` accumulates complete missed
+  periods: `lateness_ms / interval_time_ms`.
+- `Scheduler_ClearTaskStats()` must clear runtime, overrun, lateness, and missed
+  deadline counters together.
+
+Validation and error matrix:
+
+| Case | Required behavior | Test point |
+|------|-------------------|------------|
+| Task starts exactly at deadline | `last_lateness_ms == 0` | scheduler host test |
+| Task runs longer than its interval | `overrun_count++`, next immediate scan does not rerun it | scheduler host test |
+| Tick jumps far past deadline | task runs once, missed periods are counted | scheduler host test |
+| Invalid task ID or null stats pointer | `Scheduler_GetTaskStats()` returns `false` | scheduler host test when expanded |
+
+Good/base/bad cases:
+
+- Good: a 1 ms task delayed until 150 ms runs once and records lateness/missed
+  periods.
+- Base: a task with no lateness keeps lateness counters at zero.
+- Bad: a `while` loop advances `deadline_ms` one period at a time and lets a
+  high-frequency task immediately run again before lower-priority tasks can
+  progress.
+
+Wrong vs correct:
+
+```c
+/* Wrong: replays every historical period and can starve lower-priority tasks. */
+while (deadline_is_in_the_past) {
+    task->deadline_ms += task->interval_time_ms;
+}
+
+/* Correct: run once, record lateness, and schedule the next future deadline. */
+task->deadline_ms = Scheduler_GetTick() + task->interval_time_ms;
+```
+
+Tests required:
+
+```powershell
+gcc -std=c99 -Wall -Wextra -Werror -DSCHEDULER_HOST_TEST -IUser -IUser/App -IUser/Driver tests/scheduler_test.c User/scheduler.c -o tests/scheduler_test.exe
+.\tests\scheduler_test.exe
+```
+
+Assertions must cover task order, no immediate rerun after overrun,
+`missed_deadline_count`, `last_lateness_ms`, `max_lateness_ms`, runtime stats,
+and clearing all stats fields.
+
+### Non-Blocking Gray ADC Sampling Contract
+
+Scope / trigger: use this contract when changing
+`User/Driver/gray_sensor_driver.*` or the runtime portion of
+`User/App/line_track_app.c`.
+
+Signatures:
+
+```c
+bool GraySensor_DriverStartSampleSelected(void);
+gray_sensor_sample_status_t GraySensor_DriverPollSampleSelected(uint16_t *out_value);
+void GraySensor_DriverAbortSampleSelected(void);
+bool GraySensor_DriverSelectChannel(uint8_t channel);
+```
+
+Contracts:
+
+- Scheduler tasks must use Start/Poll/Abort for periodic gray sensor sampling;
+  they must not busy-wait for ADC/DMA completion.
+- `GraySensor_DriverStartSampleSelected()` starts one sample on the currently
+  selected channel and returns without waiting.
+- `GraySensor_DriverPollSampleSelected()` returns `BUSY` without blocking until
+  the ADC/DMA completion flag is present.
+- `READY` writes exactly one ADC sample to `out_value`, stops ADC/DMA, clears
+  the DMA-done flag, and releases the busy state.
+- `Abort` stops ADC/DMA, clears the DMA-done flag, and releases the busy state.
+- `GraySensor_DriverSelectChannel()` must reject channel changes while a
+  non-blocking sample is busy so channel selection and ADC result cannot drift.
+- The App layer owns frame assembly, channel averaging, timeout policy, and
+  snapshot publishing.
+
+Validation and error matrix:
+
+| Case | Required behavior | Owner |
+|------|-------------------|-------|
+| Start while idle | DMA/ADC start, status becomes busy | Driver |
+| Poll before completion | returns `GRAY_SENSOR_SAMPLE_STATUS_BUSY` | Driver |
+| Poll after completion with null output | aborts sample and returns `ERROR` | Driver |
+| Channel change while busy | returns `false` | Driver |
+| App timeout | aborts sample and discards half-frame | App |
+| Complete 8-channel frame | publishes one coherent snapshot | App |
+
+Good/base/bad cases:
+
+- Good: `LineTrack_AppTask()` starts or polls at most one ADC sample per call.
+- Base: existing pure calibration/normalization/position logic stays host
+  testable with `LINE_TRACK_HOST_TEST`.
+- Bad: reading all 8 channels in one scheduler task with synchronous ADC waits.
+
+Wrong vs correct:
+
+```c
+/* Wrong: a periodic task waits inside the ADC loop. */
+while (adc_dma_done == 0U) {
+    wait_count--;
+}
+
+/* Correct: start now, return, and poll in a later scheduler call. */
+(void)GraySensor_DriverStartSampleSelected();
+status = GraySensor_DriverPollSampleSelected(&sample);
+```
+
+Tests required:
+
+```powershell
+gcc -std=c99 -Wall -Wextra -Werror -DLINE_TRACK_HOST_TEST -IUser/App tests/gray_sensor_logic_test.c User/App/line_track_app.c -o tests/gray_sensor_logic_test.exe
+.\tests\gray_sensor_logic_test.exe
+```
+
+Hardware validation should confirm that `LineTrack_AppGetSnapshot()` becomes
+valid after complete frames, ADC timeout does not freeze the scheduler, and
+`Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, ...)` does not show
+repeated overruns during normal sampling.
+
+---
+
 ## Testing Requirements
 
 At minimum, run the host-side protocol test after changing
