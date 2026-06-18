@@ -307,8 +307,7 @@ void Gyro_AppTask(void)
     {
         /* 把协议层输出样本合并到应用层最新数据快照中。 */
         Gyro_AppUpdateLatest(&sample);
-        /* 如果到达打印周期，就把最新数据输出到 PC 串口。 */
-        Gyro_AppPrintLatestIfDue();
+        /* 调试输出已关闭，减少 UART0 DMA 负载 */
     }
 }
 

@@ -15,6 +15,12 @@
 extern "C" {
 #endif
 
+/* 电机通道识别模式的点动速度。数值较小，方便架空车轮时观察通道和方向。 */
+#define MOTOR_APP_IDENTIFY_JOG_SPEED        (300)
+
+/* 电机通道识别模式中“没有有效目标通道”的公开标记。 */
+#define MOTOR_APP_IDENTIFY_NO_MOTOR         (0xFFU)
+
 /**
  * @brief  电机应用层保存的最新运行状态。
  *
@@ -30,6 +36,9 @@ typedef struct
     uint32_t rx_count;                                 /* 成功解析的电机返回帧数量。 */
     uint32_t crc_error_count;                          /* 收到但 CRC 或格式错误的返回帧数量。 */
     uint32_t last_rx_ms;                               /* 最近一次成功解析返回帧的系统 tick。 */
+    uint8_t identify_key_mask;                         /* 点动识别最近读取到的 K1~K4 稳定按键掩码。 */
+    uint8_t identify_selected_motor;                   /* 点动识别选中的电机索引，0xFF 表示无键或多键。 */
+    bool identify_last_send_ok;                        /* 最近一次点动状态变化时速度帧是否发送成功。 */
 } motor_app_status_t;
 
 void Motor_AppInit(void);

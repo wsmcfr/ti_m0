@@ -10,6 +10,8 @@
 
 #include <string.h>
 
+#include "key_app.h"
+#include "gyro_app.h"
 #include "scheduler.h"
 #include "uart_app.h"
 
@@ -22,9 +24,42 @@ static motor_app_status_t s_motor_status;
 /* 记录最近一次请求读取的编码器索引，用于单寄存器响应映射到对应电机。 */
 static uint8_t s_motor_last_encoder_request = 0U;
 
+/*
+ * 各路电机的方向系数：+1 表示正速度 = 前进，-1 表示正速度 = 后退（接线反向）。
+ * 实测：电机 A（左轮）正速度为后退，因此系数取 -1；其余三路待确认后按需修改。
+ * 所有通过 Motor_AppSetSpeeds / Motor_AppSetSpeed 等接口下发的速度都乘以此系数，
+ * 使上层代码始终用"正值 = 该轮前进"的语义控制电机，屏蔽硬件接线差异。
+ */
+static const int16_t s_motor_direction[MOTOR_PROTOCOL_MOTOR_COUNT] = { -1, 1, 1, 1 };
+
+/* 点动识别模式最近一次已经下发的目标通道，用于避免相同状态下重复发送速度帧。 */
+static uint8_t s_motor_identify_active_motor = MOTOR_APP_IDENTIFY_NO_MOTOR;
+
+/* ========== K3 直线行驶状态机 ========== */
+
+/* 直线行驶基础速度，正值表示前进方向。 */
+#define MOTOR_APP_STRAIGHT_BASE_SPEED   (40)
+
+/* 直线行驶持续时间，单位 ms。 */
+#define MOTOR_APP_STRAIGHT_DURATION_MS  (10000UL)
+
+/* 陀螺仪航向校正 P 系数：偏 1° 修正 2 个速度单位。 */
+#define MOTOR_APP_STRAIGHT_KP           (2.0f)
+
+/* 直线行驶运行状态：false = 空闲，true = 正在行驶。 */
+static bool s_straight_running = false;
+
+/* 直线行驶起始系统 tick，用于超时判断。 */
+static uint32_t s_straight_start_tick = 0U;
+
+/* 直线行驶起始 yaw 角度，用于计算偏差。 */
+static float s_straight_start_yaw = 0.0f;
+
 static bool Motor_AppSendFrame(const uint8_t *frame, size_t length);
 static bool Motor_AppSetSpeedSnapshot(const int16_t speeds[MOTOR_PROTOCOL_MOTOR_COUNT]);
 static void Motor_AppHandleRxPacket(const uint8_t *data, uint16_t length);
+static uint8_t Motor_AppGetSinglePressedKeyIndex(uint8_t key_mask);
+static void Motor_AppRunIdentifyJog(void);
 
 /**
  * @brief  发送一帧电机 Modbus RTU 数据。
@@ -163,10 +198,181 @@ static void Motor_AppHandleRxPacket(const uint8_t *data, uint16_t length)
 }
 
 /**
+ * @brief  从按键掩码中提取唯一按下的按键索引。
+ *
+ * @note   电机通道识别模式要求一次只按一个键。无键或多键都返回
+ *         MOTOR_APP_IDENTIFY_NO_MOTOR，让上层进入全停状态，避免误判通道。
+ *
+ * @param  key_mask bit0~bit3 对应 K1~K4 的稳定按下状态。
+ * @return 0~3 表示唯一按下的按键索引；0xFF 表示无键或多键。
+ */
+static uint8_t Motor_AppGetSinglePressedKeyIndex(uint8_t key_mask)
+{
+    /* 只保留当前工程实际使用的 K1~K4 四个 bit。 */
+    uint8_t masked = (uint8_t)(key_mask & 0x0FU);
+    /* 保存唯一按键的候选索引。 */
+    uint8_t selected = MOTOR_APP_IDENTIFY_NO_MOTOR;
+
+    /* 无键按下时没有需要点动的目标通道。 */
+    if (masked == 0U)
+    {
+        /* 返回无目标通道，让调用者保持或发送停机命令。 */
+        return MOTOR_APP_IDENTIFY_NO_MOTOR;
+    }
+
+    /* 扫描 K1~K4，寻找是否恰好只有一个 bit 被置位。 */
+    for (uint8_t i = 0U; i < MOTOR_PROTOCOL_MOTOR_COUNT; i++)
+    {
+        /* 当前按键对应的 bit。 */
+        uint8_t bit = (uint8_t)(1U << i);
+
+        /* 当前 bit 未按下时跳过。 */
+        if ((masked & bit) == 0U)
+        {
+            /* 继续检查下一个按键。 */
+            continue;
+        }
+
+        /* 如果此前已经找到过一个按键，说明当前是多键按下。 */
+        if (selected != MOTOR_APP_IDENTIFY_NO_MOTOR)
+        {
+            /* 多键状态不安全，返回无目标通道，由上层全停。 */
+            return MOTOR_APP_IDENTIFY_NO_MOTOR;
+        }
+
+        /* 记录唯一按下按键的索引，后续还会继续扫描确认没有第二个键。 */
+        selected = i;
+    }
+
+    /* 返回唯一按下按键的索引；如果没有找到则为无目标通道。 */
+    return selected;
+}
+
+/**
+ * @brief  运行按键点动式电机通道识别逻辑。
+ *
+ * @note   K1~K4 分别映射电机 A~D。只有单键按下时点动对应通道；
+ *         松开或多键按下时发送四路全停。函数只在目标通道变化时发送速度帧，
+ *         降低 UART3 重复命令占用。
+ *
+ * @param  无。
+ * @return 无。
+ */
+static void Motor_AppRunIdentifyJog(void)
+{
+    /* 读取按键应用层确认后的稳定按下状态，避免直接响应抖动原始 GPIO。 */
+    uint8_t key_mask = Key_AppGetStableMask();
+    /* 用静态变量记录上一次按键状态，自行检测按下边沿。
+     * 初始化为 0xFF 而非 0x00，确保第一次调用不产生虚假上升沿（防止上电瞬态触发 K3）。 */
+    static uint8_t s_last_key_mask = 0xFFU;
+    uint8_t key_pressed_edge = (uint8_t)(key_mask & (uint8_t)(~s_last_key_mask));
+    s_last_key_mask = key_mask;
+    /* 将单键按下状态转换为电机通道索引。 */
+    uint8_t selected_motor = Motor_AppGetSinglePressedKeyIndex(key_mask);
+    /* 准备四路速度快照，默认全停。 */
+    int16_t speeds[MOTOR_PROTOCOL_MOTOR_COUNT] = {0};
+
+    /*
+     * ======== K3 直线行驶状态机 ========
+     * K3 按下边沿切换：IDLE → RUNNING，RUNNING → IDLE（急停）。
+     * RUNNING 期间用陀螺仪 yaw 整数 P 校正，10 秒超时自动停止。
+     */
+    if ((key_pressed_edge & KEY_DRIVER_MASK_K1) != 0U)
+    {
+        if (s_straight_running == false)
+        {
+            /* 启动直线行驶 */
+            s_straight_running = true;
+            s_straight_start_tick = Scheduler_GetTick();
+            s_straight_start_yaw = Gyro_AppGetYaw();
+        }
+        else
+        {
+            /* 急停 */
+            s_straight_running = false;
+            (void)Motor_AppSetSpeed4(0, 0, 0, 0);
+        }
+        /* K3 事件已处理，不再往下走点动逻辑 */
+        s_motor_status.identify_key_mask = (uint8_t)(key_mask & 0x0FU);
+        s_motor_status.identify_selected_motor = selected_motor;
+        return;
+    }
+
+    /* 直线行驶中：每 50ms 更新一次速度命令，其它按键不响应 */
+    if (s_straight_running == true)
+    {
+        uint32_t elapsed = (uint32_t)(Scheduler_GetTick() - s_straight_start_tick);
+        if (elapsed >= MOTOR_APP_STRAIGHT_DURATION_MS)
+        {
+            /* 10 秒到，停止 */
+            s_straight_running = false;
+            (void)Motor_AppSetSpeed4(0, 0, 0, 0);
+        }
+        else if ((elapsed % 50U) < 5U)
+        {
+            /* 每 50ms 窗口内只发送一次速度命令，减轻 UART3 负载 */
+            int16_t yaw_now = (int16_t)(Gyro_AppGetYaw() * 10.0f);
+            int16_t yaw_start = (int16_t)(s_straight_start_yaw * 10.0f);
+            int16_t yaw_error_x10 = (int16_t)(yaw_now - yaw_start);
+            int16_t correction = (int16_t)(yaw_error_x10 / 5);
+
+            int16_t left_speed  = (int16_t)(-(MOTOR_APP_STRAIGHT_BASE_SPEED + correction));
+            int16_t right_speed = (int16_t)(MOTOR_APP_STRAIGHT_BASE_SPEED - correction);
+
+            (void)Motor_AppSetSpeed4(left_speed, right_speed, 0, 0);
+        }
+        s_motor_status.identify_key_mask = (uint8_t)(key_mask & 0x0FU);
+        s_motor_status.identify_selected_motor = selected_motor;
+        return;
+    }
+
+    /* ======== 空闲时 K1/K2 点动逻辑（原有）======== */
+
+    /*
+     * 先更新诊断快照。即使后续状态未变化、不需要重复发送，OLED 也能看到
+     * 当前按键实际读数和点动选择结果，便于区分 GPIO/消抖问题和发送问题。
+     */
+    s_motor_status.identify_key_mask = (uint8_t)(key_mask & 0x0FU);
+    s_motor_status.identify_selected_motor = selected_motor;
+
+    /* 如果目标通道没有变化，就不重复发送同样的速度命令。
+     * 只有 K1(A)/K2(B) 参与点动判断，K3/K4 被直线行驶逻辑使用，不进入此分支。 */
+    if ((selected_motor != 0U) && (selected_motor != 1U) &&
+        (selected_motor != MOTOR_APP_IDENTIFY_NO_MOTOR))
+    {
+        /* K3/K4 对应的通道 2/3 不参与点动，直接忽略 */
+        return;
+    }
+    if (selected_motor == s_motor_identify_active_motor)
+    {
+        /* 点动状态未变化，直接返回。 */
+        return;
+    }
+
+    /* 单键按下时，只给对应通道低速点动。K1 已分配给直线行驶，这里只处理 K2。 */
+    if (selected_motor < MOTOR_PROTOCOL_MOTOR_COUNT)
+    {
+        if (selected_motor == 1U)
+        {
+            /* 右轮：正方向即前进 */
+            speeds[1] = MOTOR_APP_IDENTIFY_JOG_SPEED;
+        }
+    }
+
+    /* 发送四路速度快照；发送成功后才更新当前点动状态。 */
+    s_motor_status.identify_last_send_ok = Motor_AppSetSpeedSnapshot(speeds);
+    if (s_motor_status.identify_last_send_ok == true)
+    {
+        /* 记录当前已经下发的点动目标，避免下一周期重复发送。 */
+        s_motor_identify_active_motor = selected_motor;
+    }
+}
+
+/**
  * @brief  初始化电机应用层。
  *
- * @note   默认不自动写闭环或速度，避免上电立即让电机动作。
- *         业务代码需要显式调用 Motor_AppEnableClosedLoop() 和速度设置接口。
+ * @note   初始化时会尝试写一次闭环使能，便于后续按键点动识别直接发送速度命令。
+ *         这里不会写入非零速度，因此上电后仍保持电机静止。
  *
  * @param  无。
  * @return 无。
@@ -177,9 +383,20 @@ void Motor_AppInit(void)
     memset(&s_motor_status, 0, sizeof(s_motor_status));
     /* 默认最近请求索引为 0，后续请求编码器时会更新。 */
     s_motor_last_encoder_request = 0U;
+    /* 初始化点动识别状态为无目标通道，确保上电默认不让任何电机动作。 */
+    s_motor_identify_active_motor = MOTOR_APP_IDENTIFY_NO_MOTOR;
+    /* 初始化点动诊断为无键、无通道、未发送，供 OLED 上电后显示确定状态。 */
+    s_motor_status.identify_key_mask = 0U;
+    s_motor_status.identify_selected_motor = MOTOR_APP_IDENTIFY_NO_MOTOR;
+    s_motor_status.identify_last_send_ok = false;
     /* 输出一次初始化提示，日志失败不影响电机串口后续使用。 */
     (void)my_printf("[MOTOR] protocol ready: slave=0x%02X, UART3=115200\r\n",
         (unsigned int)MOTOR_PROTOCOL_SLAVE_ADDR);
+    /*
+     * 点动识别需要电机板处于闭环速度模式。
+     * 这里尝试发送一次闭环使能；失败只影响电机响应，不阻塞系统其它任务。
+     */
+    (void)Motor_AppEnableClosedLoop();
 }
 
 /**
@@ -195,6 +412,9 @@ void Motor_AppTask(void)
 {
     /* 保存本次从 UART3 读取到的数据长度。 */
     uint16_t length;
+
+    /* 先处理按键点动识别逻辑，让用户可以逐路确认 A/B/C/D 通道。 */
+    Motor_AppRunIdentifyJog();
 
     /* 读取一包由 UART 空闲中断或 DMA 满缓冲切出的电机返回数据。 */
     length = Uart_AppReadMotorPacket(s_motor_rx_buffer,

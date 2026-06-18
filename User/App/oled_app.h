@@ -12,6 +12,7 @@
 
 #include "line_track_app.h"
 #include "motor_app.h"
+#include "uart_app.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +34,8 @@ typedef struct
     line_track_snapshot_t line_snapshot;      /* 灰度循迹状态快照。 */
     bool has_motor_status;                    /* true 表示 motor_status 内有有效电机数据。 */
     motor_app_status_t motor_status;          /* 电机运行状态快照。 */
+    bool has_motor_uart_stats;                /* true 表示 motor_uart_stats 内有 UART3 诊断统计。 */
+    uart_driver_stats_t motor_uart_stats;     /* 电机 UART3 收发统计，用于判断命令是否发出或超时。 */
 } oled_app_display_state_t;
 
 void Oled_AppInit(void);

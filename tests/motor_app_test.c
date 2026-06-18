@@ -19,6 +19,8 @@ static uint8_t s_last_motor_frame[MOTOR_PROTOCOL_MAX_FRAME_SIZE];
 static uint16_t s_last_motor_length;
 /* 记录测试桩累计收到的电机发送请求次数。 */
 static uint32_t s_motor_send_count;
+/* 保存按键应用层桩函数返回的稳定按下状态。 */
+static uint8_t s_key_stable_mask;
 
 /*
  * 函数作用：
@@ -38,6 +40,22 @@ static void reset_uart_stub(void)
     s_last_motor_length = 0U;
     /* 清空发送次数统计。 */
     s_motor_send_count = 0U;
+}
+
+/*
+ * 函数作用：
+ *   提供按键稳定状态桩函数，让测试用例模拟 K1~K4 的当前按下状态。
+ * 主要流程：
+ *   直接返回测试全局变量，业务代码会把该掩码解释为 K1~K4。
+ * 参数说明：
+ *   无参数。
+ * 返回值说明：
+ *   bit0~bit3 对应 K1~K4，1 表示按下。
+ */
+uint8_t Key_AppGetStableMask(void)
+{
+    /* 返回测试用例预设的按键状态。 */
+    return s_key_stable_mask;
 }
 
 /*
@@ -268,6 +286,158 @@ static void test_stop_selected_motor_and_reject_invalid_index(void)
     assert(s_motor_send_count == 0U);
 }
 
+/*
+ * 函数作用：
+ *   验证单个按键会点动对应的单一路电机通道。
+ * 主要流程：
+ *   依次模拟 K1~K4 单键按下，调用 Motor_AppTask() 后检查速度帧中只有对应通道为低速。
+ * 参数说明：
+ *   无参数。
+ * 返回值说明：
+ *   无返回值，断言失败会中止测试。
+ */
+static void test_identify_mode_jogs_selected_channel_by_key(void)
+{
+    /* 准备读取应用层点动诊断状态。 */
+    motor_app_status_t status;
+
+    /* 按键到电机通道采用 K1=A、K2=B、K3=C、K4=D 的固定映射。 */
+    for (uint8_t key_index = 0U; key_index < MOTOR_PROTOCOL_MOTOR_COUNT; key_index++)
+    {
+        /* 初始化电机应用层，确保每轮从停止状态开始。 */
+        Motor_AppInit();
+        reset_uart_stub();
+
+        /* 只按下当前测试按键。 */
+        s_key_stable_mask = (uint8_t)(1U << key_index);
+        /* 调用电机任务，让点动识别逻辑读取按键并发送速度命令。 */
+        Motor_AppTask();
+
+        /* 单键点动应只发送一帧速度命令。 */
+        assert(s_motor_send_count == 1U);
+        /* 验证被选中的通道为低速正转。 */
+        assert(get_sent_speed(key_index) == MOTOR_APP_IDENTIFY_JOG_SPEED);
+
+        /* 验证其它未选中通道都被写 0，避免多个电机同时动作。 */
+        for (uint8_t motor_index = 0U; motor_index < MOTOR_PROTOCOL_MOTOR_COUNT; motor_index++)
+        {
+            if (motor_index != key_index)
+            {
+                assert(get_sent_speed(motor_index) == 0);
+            }
+        }
+
+        /* 验证状态快照会暴露本次点动识别的按键、返回通道和发送结果。 */
+        assert(Motor_AppGetStatus(&status) == true);
+        assert(status.identify_key_mask == (uint8_t)(1U << key_index));
+        assert(status.identify_selected_motor == key_index);
+        assert(status.identify_last_send_ok == true);
+    }
+
+    /* 测试结束后清空按键状态，避免影响后续用例。 */
+    s_key_stable_mask = 0U;
+}
+
+/*
+ * 函数作用：
+ *   验证多键同时按下时点动识别逻辑会停机。
+ * 主要流程：
+ *   先让 K1 点动建立运动状态，再模拟 K1+K2 同时按下，检查四路速度都被写 0。
+ * 参数说明：
+ *   无参数。
+ * 返回值说明：
+ *   无返回值，断言失败会中止测试。
+ */
+static void test_identify_mode_stops_when_multiple_keys_pressed(void)
+{
+    /* 准备读取应用层点动诊断状态。 */
+    motor_app_status_t status;
+
+    /* 初始化电机应用层状态。 */
+    Motor_AppInit();
+    reset_uart_stub();
+
+    /* 先按 K1，让 A 通道进入低速点动。 */
+    s_key_stable_mask = 0x01U;
+    Motor_AppTask();
+    assert(s_motor_send_count == 1U);
+    assert(get_sent_speed(0U) == MOTOR_APP_IDENTIFY_JOG_SPEED);
+
+    /* 再模拟 K1 和 K2 同时按下，多键应触发停机。 */
+    reset_uart_stub();
+    s_key_stable_mask = 0x03U;
+    Motor_AppTask();
+
+    /* 多键状态变化应发送一次全停速度命令。 */
+    assert(s_motor_send_count == 1U);
+    for (uint8_t motor_index = 0U; motor_index < MOTOR_PROTOCOL_MOTOR_COUNT; motor_index++)
+    {
+        assert(get_sent_speed(motor_index) == 0);
+    }
+
+    /* 验证多键会被诊断为无有效返回通道，但停机命令已经发送成功。 */
+    assert(Motor_AppGetStatus(&status) == true);
+    assert(status.identify_key_mask == 0x03U);
+    assert(status.identify_selected_motor == MOTOR_APP_IDENTIFY_NO_MOTOR);
+    assert(status.identify_last_send_ok == true);
+
+    /* 测试结束后清空按键状态。 */
+    s_key_stable_mask = 0U;
+}
+
+/*
+ * 函数作用：
+ *   验证松开按键后点动识别逻辑会停机，并且状态不变时不会重复发送。
+ * 主要流程：
+ *   按下 K3 点动 C 通道，再松开全部按键，检查发送一次全停；再次调用不应重复发送。
+ * 参数说明：
+ *   无参数。
+ * 返回值说明：
+ *   无返回值，断言失败会中止测试。
+ */
+static void test_identify_mode_stops_on_release_without_repeating(void)
+{
+    /* 准备读取应用层点动诊断状态。 */
+    motor_app_status_t status;
+
+    /* 初始化电机应用层状态。 */
+    Motor_AppInit();
+    reset_uart_stub();
+
+    /* 按下 K3，预期 C 通道点动。 */
+    s_key_stable_mask = 0x04U;
+    Motor_AppTask();
+    assert(s_motor_send_count == 1U);
+    assert(get_sent_speed(2U) == MOTOR_APP_IDENTIFY_JOG_SPEED);
+
+    /* 松开全部按键，预期发送一次全停。 */
+    reset_uart_stub();
+    s_key_stable_mask = 0x00U;
+    Motor_AppTask();
+    assert(s_motor_send_count == 1U);
+    for (uint8_t motor_index = 0U; motor_index < MOTOR_PROTOCOL_MOTOR_COUNT; motor_index++)
+    {
+        assert(get_sent_speed(motor_index) == 0);
+    }
+
+    /* 验证松开后 OLED 可看到按键为 0、返回通道无效、停机发送成功。 */
+    assert(Motor_AppGetStatus(&status) == true);
+    assert(status.identify_key_mask == 0x00U);
+    assert(status.identify_selected_motor == MOTOR_APP_IDENTIFY_NO_MOTOR);
+    assert(status.identify_last_send_ok == true);
+
+    /* 保持松开状态再次运行任务，不应重复发送相同全停命令。 */
+    reset_uart_stub();
+    Motor_AppTask();
+    assert(s_motor_send_count == 0U);
+
+    /* 未重复发送时诊断状态仍保留最近一次有效停机结果。 */
+    assert(Motor_AppGetStatus(&status) == true);
+    assert(status.identify_key_mask == 0x00U);
+    assert(status.identify_selected_motor == MOTOR_APP_IDENTIFY_NO_MOTOR);
+    assert(status.identify_last_send_ok == true);
+}
+
 int main(void)
 {
     /* 运行两路速度指定测试。 */
@@ -276,6 +446,12 @@ int main(void)
     test_set_one_motor_keeps_cached_other_speeds();
     /* 运行指定电机停止和非法索引拒绝测试。 */
     test_stop_selected_motor_and_reject_invalid_index();
+    /* 运行按键点动识别单通道测试。 */
+    test_identify_mode_jogs_selected_channel_by_key();
+    /* 运行多键按下停机测试。 */
+    test_identify_mode_stops_when_multiple_keys_pressed();
+    /* 运行松开按键停机且不重复发送测试。 */
+    test_identify_mode_stops_on_release_without_repeating();
 
     /* 所有 assert 均通过后输出测试成功提示。 */
     puts("motor_app_test: all tests passed");

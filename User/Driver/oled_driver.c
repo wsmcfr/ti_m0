@@ -21,8 +21,27 @@
 /* SSD1306 控制字节：后续字节解释为显示数据。 */
 #define OLED_DRIVER_CONTROL_DATA        (0x40U)
 
-/* I2C 有界等待计数，避免 OLED 未连接时长时间阻塞调度器。 */
-#define OLED_DRIVER_I2C_TIMEOUT         (30000UL)
+/*
+ * I2C 有界等待计数，避免 OLED 未连接时长时间阻塞调度器。
+ * 400kHz I2C 下 2 字节传输约 40μs，32MHz 对应约 1280 cycles。
+ * 留 4 倍余量取 5000，可覆盖正常传输且单次最坏阻塞约 0.6ms。
+ * 原值 30000 × 23 条初始化命令 × 2 次等待 ≈ 276ms，会拖死 100ms LED 任务。
+ */
+#define OLED_DRIVER_I2C_TIMEOUT         (5000UL)
+
+/* OLED 上电等待周期，参考 STM32 HAL 可用驱动中 OLED_Init() 先 HAL_Delay(200)。 */
+#define OLED_DRIVER_POWER_ON_DELAY_CYCLES   (6400000UL)
+
+/* I2C controller 空闲状态掩码，DriverLib 官方示例用该位判断可启动下一笔传输。 */
+#define OLED_DRIVER_I2C_STATUS_IDLE     (DL_I2C_CONTROLLER_STATUS_IDLE)
+
+/*
+ * I2C controller 传输中状态掩码。
+ * 只检查 BUSY（控制器自身传输进行中），不 OR BUSY_BUS。
+ * BUSY_BUS 反映的是总线电平，复位后 OLED 电容放电期间 SDA 可能被拉低使该位
+ * 长时间置位，若将其加入等待条件会导致 wait_count 全部耗尽后才退出，拖死调度器。
+ */
+#define OLED_DRIVER_I2C_STATUS_ACTIVE   (DL_I2C_CONTROLLER_STATUS_BUSY)
 
 /* 6x8 ASCII 字库覆盖 0x20~0x7E，一共 95 个可打印字符。 */
 #define OLED_DRIVER_FONT_CHAR_COUNT     (95U)
@@ -99,39 +118,164 @@ static const uint8_t s_oled_init_commands[] =
 /* true 表示最近一次 OLED I2C 访问成功；应用层可据此决定是否继续刷新。 */
 static bool s_oled_driver_available = false;
 
-static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t length);
+/* true 表示 I2C controller 已经按 OLED 所需参数完成一次性补偿初始化。 */
+static bool s_oled_i2c_controller_ready = false;
+
+static void Oled_DriverI2cBusRecovery(void);
+static void Oled_DriverEnsureI2cControllerReady(void);
+static bool Oled_DriverWriteByte(uint8_t control, uint8_t value);
 
 /**
- * @brief  通过 I2C1 向 OLED 写入控制字节和数据。
+ * @brief  I2C 总线 9-clock 恢复。
  *
- * @note   写入前先把控制字节和部分数据填入 TX FIFO，再启动控制器传输；
- *         传输过程中持续补 FIFO，并用 BUSY 位和 ERROR 位做有界等待。
+ * @note   MCU 复位时若 OLED 传输未完成，OLED 从机（SSD1306）会把 SDA 拉低等待后续时钟，
+ *         导致总线卡死。后续所有 I2C 命令（包括 0xD3,0x00 显示偏移归零）都无法送达，
+ *         OLED 保留上次的显示偏移 → 内容显示在第 3 行，且任务长时间超时 → LED 饿死。
  *
- * @param  control SSD1306 控制字节，0x00 为命令，0x40 为数据。
- * @param  data    待写入数据。
- * @param  length  数据长度，不包含 control 字节。
- * @return true 表示 I2C 传输完成且未检测到错误；false 表示参数错误或超时。
+ *         恢复步骤：
+ *           1. 把 SCL(PA29) 临时切成 GPIO 输出，SDA(PA30) 切成 GPIO 输入
+ *           2. 拉动 SCL 最多 9 次，让从机把剩余数据位移出并释放 SDA
+ *           3. 手动产生 STOP（SCL 高时 SDA 上升沿）
+ *           4. 把引脚切回 I2C 外设功能，复位并重新使能 I2C1 控制器
+ *
+ * @param  无。
+ * @return 无。
  */
-static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t length)
+static void Oled_DriverI2cBusRecovery(void)
 {
-    /* TX FIFO 先发送控制字节，再发送 payload。 */
-    uint8_t control_byte = control;
-    /* 已经写入 FIFO 的 payload 字节数。 */
-    uint16_t sent = 0U;
-    /* 等待 I2C 空闲的保护计数。 */
-    uint32_t wait_count = OLED_DRIVER_I2C_TIMEOUT;
+    /* 1. 把 SCL(PA29/PINCM4) 切换为 GPIO 数字输出 */
+    DL_GPIO_initDigitalOutput(GPIO_I2C_OLED_IOMUX_SCL);
+    /* DL_GPIO_initDigitalOutput 只配置 IOMUX，还需要单独使能 GPIO 方向寄存器才能驱动引脚。 */
+    DL_GPIO_enableOutput(GPIO_I2C_OLED_SCL_PORT, GPIO_I2C_OLED_SCL_PIN);
+    /* 把 SDA(PA30/PINCM5) 切换为 GPIO 输入（保留上拉，用于读取从机释放状态）*/
+    DL_GPIO_initDigitalInputFeatures(GPIO_I2C_OLED_IOMUX_SDA,
+        DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_PULL_UP,
+        DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
 
-    /* 参数检查：payload 长度非 0 时数据指针必须有效。 */
-    if ((data == NULL) || (length == 0U))
+    /* 2. SCL 先拉高，让总线进入已知高电平状态 */
+    DL_GPIO_setPins(GPIO_I2C_OLED_SCL_PORT, GPIO_I2C_OLED_SCL_PIN);
+    DL_Common_delayCycles(32000U); /* 1ms */
+
+    /* 3. 拉动 SCL 最多 9 次，直到 SDA 被从机释放（读到高电平）*/
+    for (uint8_t i = 0U; i < 9U; i++)
     {
-        /* OLED 写入不接受空 payload。 */
-        s_oled_driver_available = false;
-        return false;
+        DL_GPIO_clearPins(GPIO_I2C_OLED_SCL_PORT, GPIO_I2C_OLED_SCL_PIN); /* SCL 低 */
+        DL_Common_delayCycles(32000U); /* 1ms */
+        DL_GPIO_setPins(GPIO_I2C_OLED_SCL_PORT, GPIO_I2C_OLED_SCL_PIN);   /* SCL 高 */
+        DL_Common_delayCycles(32000U); /* 1ms */
+        if (DL_GPIO_readPins(GPIO_I2C_OLED_SDA_PORT, GPIO_I2C_OLED_SDA_PIN) != 0U)
+        {
+            /* SDA 已经释放，从机不再占用总线 */
+            break;
+        }
     }
 
-    /* 等待上一笔 I2C 事务结束，避免重入启动控制器传输。 */
+    /* 4. 手动产生 STOP 条件：把 SDA 切为输出，SDA低 → SCL高 → SDA高 */
+    DL_GPIO_initDigitalOutput(GPIO_I2C_OLED_IOMUX_SDA);
+    /* 同样需要使能 SDA 的 GPIO 方向寄存器。 */
+    DL_GPIO_enableOutput(GPIO_I2C_OLED_SDA_PORT, GPIO_I2C_OLED_SDA_PIN);
+    DL_GPIO_clearPins(GPIO_I2C_OLED_SDA_PORT, GPIO_I2C_OLED_SDA_PIN); /* SDA 低 */
+    DL_Common_delayCycles(32000U);
+    DL_GPIO_setPins(GPIO_I2C_OLED_SCL_PORT, GPIO_I2C_OLED_SCL_PIN);   /* SCL 高 */
+    DL_Common_delayCycles(32000U);
+    DL_GPIO_setPins(GPIO_I2C_OLED_SDA_PORT, GPIO_I2C_OLED_SDA_PIN);   /* SDA 高 = STOP */
+    DL_Common_delayCycles(32000U);
+
+    /* 5. 把 PA29/PA30 切回 I2C1 外设功能，完整复制 SysConfig GPIO_init 里的配置 */
+    DL_GPIO_initPeripheralInputFunctionFeatures(
+        GPIO_I2C_OLED_IOMUX_SDA, GPIO_I2C_OLED_IOMUX_SDA_FUNC,
+        DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_PULL_UP,
+        DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
+    DL_GPIO_initPeripheralInputFunctionFeatures(
+        GPIO_I2C_OLED_IOMUX_SCL, GPIO_I2C_OLED_IOMUX_SCL_FUNC,
+        DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_PULL_UP,
+        DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
+    DL_GPIO_enableHiZ(GPIO_I2C_OLED_IOMUX_SDA);
+    DL_GPIO_enableHiZ(GPIO_I2C_OLED_IOMUX_SCL);
+
+    /* 6. 复位并重新使能 I2C1 外设，清除控制器侧的残留状态 */
+    DL_I2C_reset(I2C_OLED_INST);
+    DL_I2C_enablePower(I2C_OLED_INST);
+    /*
+     * POWER_STARTUP_DELAY = 16 cycles 不足以保证 I2C 外设从复位状态稳定退出。
+     * 在 bus recovery 场景下，I2C 之前处于活跃状态，复位后需要更长的稳定时间。
+     * 4800 cycles = 150μs @ 32MHz，参考 TI M0P 例程的保守等待做法。
+     */
+    DL_Common_delayCycles(4800U);
+    SYSCFG_DL_I2C_OLED_init();
+
+    /* 7. 重置就绪标志，使 EnsureI2cControllerReady 重新执行完整的 controller 初始化 */
+    s_oled_i2c_controller_ready = false;
+}
+
+/**
+ * @brief  确保 OLED 使用的 I2C controller 已经启用。
+ *
+ * @note   当前 SysConfig 生成的 SYSCFG_DL_I2C_OLED_init() 只配置了 I2C 时钟和
+ *         glitch filter，没有生成 controller mode 的 reset、timer、FIFO 和 enable
+ *         步骤。这里在用户驱动层补齐官方 400kHz controller 初始化序列，避免直接修改
+ *         ti_msp_dl_config.* 生成文件。
+ *
+ * @param  无。
+ * @return 无。
+ */
+static void Oled_DriverEnsureI2cControllerReady(void)
+{
+    /*
+     * DriverLib 文档要求 controller 已启用后不要重复 enable。
+     * 因此本补偿初始化只执行一次，后续 OLED 重试只重新发送 SSD1306 命令。
+     */
+    if (s_oled_i2c_controller_ready == true)
+    {
+        /* I2C controller 已经准备好，无需重复配置。 */
+        return;
+    }
+
+    /* 复位 controller 传输寄存器，清理上电后的默认传输状态。 */
+    DL_I2C_resetControllerTransfer(I2C_OLED_INST);
+    /*
+     * empty.syscfg 中 OLED I2C 配置为 400kHz，32MHz BUSCLK 下官方示例使用 TPR=7。
+     * 计算关系为 SCL_PERIOD = (1 + TPR) * (6 + 4) * BUSCLK_PERIOD。
+     */
+    DL_I2C_setTimerPeriod(I2C_OLED_INST, 7U);
+    /* 轮询写入大块 OLED 数据时，TX FIFO 空阈值便于持续补充后续 payload。 */
+    DL_I2C_setControllerTXFIFOThreshold(I2C_OLED_INST, DL_I2C_TX_FIFO_LEVEL_EMPTY);
+    /* OLED 当前只写不读，但 controller 初始化仍保持 RX 阈值为 1 字节的标准配置。 */
+    DL_I2C_setControllerRXFIFOThreshold(I2C_OLED_INST, DL_I2C_RX_FIFO_LEVEL_BYTES_1);
+    /* 开启 clock stretching，保持 I2C controller 行为符合总线规范。 */
+    DL_I2C_enableControllerClockStretching(I2C_OLED_INST);
+    /* 最后启用 I2C controller，使后续 START/STOP 传输真正发到 PA29/PA30。 */
+    DL_I2C_enableController(I2C_OLED_INST);
+
+    /* 标记补偿初始化完成，避免后续 OLED 重试重复 enable controller。 */
+    s_oled_i2c_controller_ready = true;
+}
+
+/**
+ * @brief  通过 I2C1 向 OLED 写入 1 个控制字节和 1 个 payload 字节。
+ *
+ * @note   用户给出的可用 STM32 HAL 驱动使用 HAL_I2C_Mem_Write()，每次只写一个命令
+ *         或一个显存数据字节。本函数保留 MSPM0 DriverLib 底层，但把事务粒度收敛到
+ *         control+1 字节，用于规避当前 OLED 模块对长 I2C burst 不稳定的问题。
+ *
+ * @param  control SSD1306 控制字节，0x00 为命令，0x40 为数据。
+ * @param  value   待写入的单字节命令或显存数据。
+ * @return true 表示本次 I2C 事务完成且未检测到错误；false 表示超时或硬件错误。
+ */
+static bool Oled_DriverWriteByte(uint8_t control, uint8_t value)
+{
+    /* 两字节事务缓冲，第 0 字节为 SSD1306 控制字节，第 1 字节为实际命令/数据。 */
+    uint8_t packet[2];
+    /* 等待 I2C 空闲和传输完成共用的有界计数。 */
+    uint32_t wait_count = OLED_DRIVER_I2C_TIMEOUT;
+
+    /* 组装参考驱动等价的 control+单字节写入格式。 */
+    packet[0] = control;
+    packet[1] = value;
+
+    /* 等待上一笔 I2C 事务完全结束，避免 START/STOP 相互重叠。 */
     while (((DL_I2C_getControllerStatus(I2C_OLED_INST) &
-                DL_I2C_CONTROLLER_STATUS_BUSY) != 0U) &&
+                OLED_DRIVER_I2C_STATUS_IDLE) == 0U) &&
            (wait_count > 0UL))
     {
         /* 每轮等待消耗一个计数。 */
@@ -139,42 +283,38 @@ static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t
     }
     if (wait_count == 0UL)
     {
-        /* I2C 控制器长期忙，返回失败。 */
+        /* 总线长期不空闲，记录 OLED 不可用。 */
         s_oled_driver_available = false;
         return false;
     }
 
-    /* 清空 TX FIFO，避免上一笔失败事务残留数据。 */
+    /* 清空 TX FIFO，保证本次短事务只包含这两个字节。 */
     DL_I2C_flushControllerTXFIFO(I2C_OLED_INST);
-    /* 先填控制字节。 */
-    (void)DL_I2C_fillControllerTXFIFO(I2C_OLED_INST, &control_byte, 1U);
-    /* 再尽量填入 payload 的前若干字节。 */
-    sent = DL_I2C_fillControllerTXFIFO(I2C_OLED_INST, data, length);
-    /* 启动 I2C 写传输，长度为 control + payload。 */
-    DL_I2C_startControllerTransfer(I2C_OLED_INST, OLED_DRIVER_I2C_ADDRESS,
-        DL_I2C_CONTROLLER_DIRECTION_TX, (uint16_t)(length + 1U));
+    /* 事务只有 2 字节，正常情况下可一次性写入 FIFO。 */
+    if (DL_I2C_fillControllerTXFIFO(I2C_OLED_INST, packet,
+            (uint16_t)sizeof(packet)) != (uint16_t)sizeof(packet))
+    {
+        /* 短事务都无法完全进入 FIFO 时，直接复位传输状态并失败返回。 */
+        DL_I2C_resetControllerTransfer(I2C_OLED_INST);
+        s_oled_driver_available = false;
+        return false;
+    }
 
-    /* 等待传输完成，同时在 FIFO 有空间时继续填剩余 payload。 */
-    wait_count = OLED_DRIVER_I2C_TIMEOUT + ((uint32_t)length * 500UL);
+    /* 启动 control+payload 两字节写传输，对应 HAL_I2C_Mem_Write 的 0x00/0x40 内存地址写法。 */
+    DL_I2C_startControllerTransfer(I2C_OLED_INST, OLED_DRIVER_I2C_ADDRESS,
+        DL_I2C_CONTROLLER_DIRECTION_TX, (uint16_t)sizeof(packet));
+
+    /* 等待短事务完成，并在等待中检查 NACK/仲裁等错误。 */
+    wait_count = OLED_DRIVER_I2C_TIMEOUT;
     while (((DL_I2C_getControllerStatus(I2C_OLED_INST) &
-                DL_I2C_CONTROLLER_STATUS_BUSY) != 0U) &&
+                OLED_DRIVER_I2C_STATUS_ACTIVE) != 0U) &&
            (wait_count > 0UL))
     {
-        /* 只要还有数据未填入 FIFO，就持续尝试补充。 */
-        if (sent < length)
-        {
-            /* 将剩余 payload 尽量填入控制器 TX FIFO。 */
-            sent = (uint16_t)(sent + DL_I2C_fillControllerTXFIFO(I2C_OLED_INST,
-                &data[sent], (uint16_t)(length - sent)));
-        }
-
-        /* 如果硬件报告错误，立即复位本次控制器传输并失败返回。 */
         if ((DL_I2C_getControllerStatus(I2C_OLED_INST) &
                 DL_I2C_CONTROLLER_STATUS_ERROR) != 0U)
         {
-            /* 复位控制器传输状态，便于下次尝试恢复。 */
+            /* 复位传输状态，便于下一次 OLED 任务重试。 */
             DL_I2C_resetControllerTransfer(I2C_OLED_INST);
-            /* 返回失败，提示 OLED 可能未连接或地址不匹配。 */
             s_oled_driver_available = false;
             return false;
         }
@@ -183,26 +323,23 @@ static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t
         wait_count--;
     }
 
-    /* 超时则复位传输状态并返回失败。 */
     if (wait_count == 0UL)
     {
-        /* 复位 I2C 控制器传输寄存器，避免后续调用一直忙。 */
+        /* 传输超时后复位控制器传输寄存器，避免后续一直忙。 */
         DL_I2C_resetControllerTransfer(I2C_OLED_INST);
-        /* 返回超时失败。 */
         s_oled_driver_available = false;
         return false;
     }
 
-    /* 最终检查是否存在 I2C 错误状态。 */
     if ((DL_I2C_getControllerStatus(I2C_OLED_INST) &
             DL_I2C_CONTROLLER_STATUS_ERROR) != 0U)
     {
-        /* 错误状态下不认为写入成功。 */
+        /* 结束时仍有错误位，不能认为写入成功。 */
         s_oled_driver_available = false;
         return false;
     }
 
-    /* 写入完成。 */
+    /* 单字节事务完成。 */
     s_oled_driver_available = true;
     return true;
 }
@@ -210,26 +347,33 @@ static bool Oled_DriverWriteBytes(uint8_t control, const uint8_t *data, uint16_t
 /**
  * @brief  初始化 OLED 屏幕。
  *
- * @note   I2C1 和引脚配置由 SysConfig 完成；本函数发送 SSD1306 初始化序列并清屏。
+ * @note   I2C1 和引脚配置由 SysConfig 完成；本函数只发送 SSD1306 初始化序列。
+ *         全屏清屏会产生大量 I2C 事务，不能放在调度器首次 OLED 任务里同步执行。
  *
  * @param  无。
  * @return 无。
  */
 void Oled_DriverInit(void)
 {
+    /* 补齐 I2C controller 初始化，再发送 SSD1306 命令。 */
+    Oled_DriverEnsureI2cControllerReady();
+
     /*
-     * 批量发送 SSD1306 初始化命令，减少上电时的 START/STOP 事务数量。
-     * 初始化失败不阻塞系统启动，后续清屏或显示调用仍会用返回值暴露失败。
+     * 参考可用 HAL 驱动在初始化命令前等待 200ms。
+     * 这里使用 DriverLib 周期延时，不依赖调度器 tick，确保 OLED 电源和内部电荷泵启动稳定。
+     */
+    DL_Common_delayCycles(OLED_DRIVER_POWER_ON_DELAY_CYCLES);
+
+    /*
+     * 逐条发送 SSD1306 初始化命令。
+     * 初始化失败不阻塞系统启动，应用层会根据可用状态进入退避，避免 OLED 异常拖死主循环。
      */
     if (Oled_DriverWriteCommandBuffer(s_oled_init_commands,
         (uint16_t)sizeof(s_oled_init_commands)) == false)
     {
-        /* 未接屏或地址错误时不继续清屏，避免启动阶段多次进入 I2C 超时。 */
+        /* 未接屏或地址错误时直接返回，避免启动阶段继续进入更多 I2C 超时。 */
         return;
     }
-
-    /* 初始化完成后清空屏幕。 */
-    (void)Oled_DriverClear();
 }
 
 /**
@@ -241,7 +385,7 @@ void Oled_DriverInit(void)
 bool Oled_DriverWriteCommand(uint8_t command)
 {
     /* 使用控制字节 0x00 发送命令。 */
-    return Oled_DriverWriteBytes(OLED_DRIVER_CONTROL_COMMAND, &command, 1U);
+    return Oled_DriverWriteByte(OLED_DRIVER_CONTROL_COMMAND, command);
 }
 
 /**
@@ -255,8 +399,26 @@ bool Oled_DriverWriteCommand(uint8_t command)
  */
 bool Oled_DriverWriteCommandBuffer(const uint8_t *commands, uint16_t length)
 {
-    /* 使用控制字节 0x00 发送连续命令。 */
-    return Oled_DriverWriteBytes(OLED_DRIVER_CONTROL_COMMAND, commands, length);
+    /* 命令数组不能为空，长度也必须非 0。 */
+    if ((commands == NULL) || (length == 0U))
+    {
+        /* 参数无效时标记 OLED 不可用。 */
+        s_oled_driver_available = false;
+        return false;
+    }
+
+    /* 逐条命令写入，完全贴近参考 HAL 驱动 OLED_WR_CMD() 的事务粒度。 */
+    for (uint16_t i = 0U; i < length; i++)
+    {
+        if (Oled_DriverWriteByte(OLED_DRIVER_CONTROL_COMMAND, commands[i]) == false)
+        {
+            /* 任意一条命令失败就停止初始化/定位序列。 */
+            return false;
+        }
+    }
+
+    /* 全部命令写入成功。 */
+    return true;
 }
 
 /**
@@ -268,7 +430,7 @@ bool Oled_DriverWriteCommandBuffer(const uint8_t *commands, uint16_t length)
 bool Oled_DriverWriteData(uint8_t data)
 {
     /* 使用控制字节 0x40 发送显示数据。 */
-    return Oled_DriverWriteBytes(OLED_DRIVER_CONTROL_DATA, &data, 1U);
+    return Oled_DriverWriteByte(OLED_DRIVER_CONTROL_DATA, data);
 }
 
 /**
@@ -282,8 +444,26 @@ bool Oled_DriverWriteData(uint8_t data)
  */
 bool Oled_DriverWriteDataBuffer(const uint8_t *data, uint16_t length)
 {
-    /* 使用控制字节 0x40 发送连续显存数据。 */
-    return Oled_DriverWriteBytes(OLED_DRIVER_CONTROL_DATA, data, length);
+    /* 数据数组不能为空，长度也必须非 0。 */
+    if ((data == NULL) || (length == 0U))
+    {
+        /* 参数无效时标记 OLED 不可用。 */
+        s_oled_driver_available = false;
+        return false;
+    }
+
+    /* 逐字节写显存，等价于参考 HAL 驱动 OLED_WR_DATA() 在循环中发送每列。 */
+    for (uint16_t i = 0U; i < length; i++)
+    {
+        if (Oled_DriverWriteByte(OLED_DRIVER_CONTROL_DATA, data[i]) == false)
+        {
+            /* 某个显存字节发送失败时立即返回，由 App 层退避重试。 */
+            return false;
+        }
+    }
+
+    /* 全部显存数据写入成功。 */
+    return true;
 }
 
 /**
@@ -411,12 +591,10 @@ bool Oled_DriverShowChar(uint8_t x, uint8_t page, char ch)
  */
 bool Oled_DriverShowString(uint8_t x, uint8_t page, const char *text)
 {
-    /* 一行最多 21 个 6x8 字符，每个字符 6 列，刚好落在 128 像素宽度内。 */
-    uint8_t row_buffer[OLED_DRIVER_TEXT_COLUMNS * 6U];
-    /* 已经写入 row_buffer 的显存列数。 */
-    uint16_t row_length = 0U;
     /* 当前待显示字符的字库索引。 */
     uint8_t index;
+    /* 当前字符起始列坐标。 */
+    uint8_t current_x = x;
 
     /* 字符串不能为空，页坐标必须有效。 */
     if ((text == NULL) || (page >= OLED_DRIVER_PAGE_COUNT) || (x >= OLED_DRIVER_WIDTH))
@@ -426,12 +604,10 @@ bool Oled_DriverShowString(uint8_t x, uint8_t page, const char *text)
     }
 
     /*
-     * 把多个字符先拼成连续显存列数据，再一次写出。
-     * 这样一整行只需要“定位命令 + 数据写入”两次 I2C 事务。
+     * 逐字符定位和写入，贴近参考驱动 OLED_ShowString() -> OLED_ShowChar() 的路径。
+     * 虽然 I2C 事务更多，但每次只写很短的数据，更适合当前硬件排障阶段验证 OLED 可用性。
      */
-    while ((*text != '\0') &&
-           ((uint16_t)x + row_length + 6U <= OLED_DRIVER_WIDTH) &&
-           (row_length + 6U <= (uint16_t)sizeof(row_buffer)))
+    while ((*text != '\0') && (current_x <= (OLED_DRIVER_WIDTH - 6U)))
     {
         /* 非可打印 ASCII 统一显示为空格，避免字库越界。 */
         if ((*text < ' ') || (*text > '~'))
@@ -445,34 +621,28 @@ bool Oled_DriverShowString(uint8_t x, uint8_t page, const char *text)
             index = (uint8_t)((uint8_t)(*text) - (uint8_t)' ');
         }
 
-        /* 复制当前字符 6 列字模到行缓冲尾部。 */
-        for (uint8_t i = 0U; i < 6U; i++)
+        /* 每个字符都重新定位，降低连续显存写入对 SSD1306 地址自增状态的依赖。 */
+        if (Oled_DriverSetPosition(current_x, page) == false)
         {
-            /* row_length 始终按 6 字节递增，不会越过 row_buffer。 */
-            row_buffer[row_length + i] = s_oled_font_6x8[index][i];
+            /* 定位失败则停止本次字符串显示。 */
+            return false;
         }
 
-        /* 累加已经准备好的显存列数。 */
-        row_length = (uint16_t)(row_length + 6U);
+        /* 当前字符的 6 列字模逐字节写入。 */
+        if (Oled_DriverWriteDataBuffer(s_oled_font_6x8[index], 6U) == false)
+        {
+            /* 字模写入失败，交给 App 层退避重试。 */
+            return false;
+        }
+
+        /* 移动到下一个字符起点。 */
+        current_x = (uint8_t)(current_x + 6U);
         /* 指向下一个输入字符。 */
         text++;
     }
 
-    if (row_length == 0U)
-    {
-        /* 空字符串或剩余空间不足时无需写屏，视为成功。 */
-        return true;
-    }
-
-    /* 先设置起始写入位置。 */
-    if (Oled_DriverSetPosition(x, page) == false)
-    {
-        /* 定位失败则不继续写数据。 */
-        return false;
-    }
-
-    /* 一次写出整段字符串显存列数据。 */
-    return Oled_DriverWriteDataBuffer(row_buffer, row_length);
+    /* 已处理到字符串结尾或屏幕右边界，视为正常结束。 */
+    return true;
 }
 
 /**

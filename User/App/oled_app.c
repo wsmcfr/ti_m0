@@ -15,15 +15,26 @@
 #include "line_track_app.h"
 #include "motor_app.h"
 #include "oled_driver.h"
+#include "uart_app.h"
 
-/* OLED 正常刷新间隔。显示状态不需要高频刷新，降低 I2C 占用。 */
-#define OLED_APP_REFRESH_INTERVAL_TICKS     (4U)
+/*
+ * OLED 正常刷新间隔。
+ * 当前 OLED 任务已经拆成字符级分片，每次任务最多写 1 个 6x8 字符，避免 I2C
+ * 显示刷新长时间占用协作式调度器。
+ */
+#define OLED_APP_REFRESH_INTERVAL_TICKS     (1U)
 
-/* OLED 连续失败后的退避任务次数，避免未接屏时每轮都进入较长 I2C 超时。 */
-#define OLED_APP_ERROR_BACKOFF_TICKS        (120U)
+/*
+ * OLED 连续失败后的退避任务次数，避免未接屏时每轮都进入较长 I2C 超时。
+ * OLED 任务周期为 250ms，8 次约 2 秒；调试接线时比原 30 秒退避更容易观察恢复。
+ */
+#define OLED_APP_ERROR_BACKOFF_TICKS        (8U)
 
-/* 低频刷新分片计数，每次任务只刷一行，避免单次任务写太多 I2C 字节。 */
+/* 低频刷新行分片计数，每轮依次刷新 0~3 行。 */
 static uint8_t s_oled_refresh_slice = 0U;
+
+/* 当前行内的字符列索引，每次 OLED 任务只推进一个字符。 */
+static uint8_t s_oled_refresh_column = 0U;
 
 /* true 表示 OLED 初始化流程已经执行。 */
 static bool s_oled_ready = false;
@@ -42,9 +53,10 @@ static void Oled_AppFillLine(char *out_text);
 static bool Oled_AppAppendChar(char *out_text, size_t *cursor, char ch);
 static bool Oled_AppAppendText(char *out_text, size_t *cursor, const char *text);
 static bool Oled_AppAppendHexByte(char *out_text, size_t *cursor, uint8_t value);
+static bool Oled_AppAppendUnsigned2(char *out_text, size_t *cursor, uint32_t value);
 static bool Oled_AppAppendSignedNumber(char *out_text, size_t *cursor,
     int32_t value, uint8_t width);
-static bool Oled_AppRefreshLine(uint8_t line_index);
+static bool Oled_AppRefreshNextChar(void);
 
 /**
  * @brief  采集指定 OLED 行显示所需的跨模块状态。
@@ -69,20 +81,25 @@ static void Oled_AppBuildDisplayState(uint8_t line_index, oled_app_display_state
     switch (line_index)
     {
         case 0U:
-            /* 第 0 行只需要当前稳定按键掩码。 */
+            /* 第 0 行显示按键点动诊断，优先读取电机状态，同时保留原始按键兜底。 */
             out_state->key_mask = Key_AppGetStableMask();
+            out_state->has_motor_status = Motor_AppGetStatus(&out_state->motor_status);
             break;
 
         case 1U:
-            /* 第 1 行只需要灰度循迹快照。 */
-            out_state->has_line_snapshot =
-                LineTrack_AppGetSnapshot(&out_state->line_snapshot);
+        case 2U:
+            /* 第 1/2 行显示四路电机目标速度。 */
+            out_state->has_motor_status = Motor_AppGetStatus(&out_state->motor_status);
             break;
 
-        case 2U:
         case 3U:
-            /* 第 2/3 行只需要电机状态快照。 */
-            out_state->has_motor_status = Motor_AppGetStatus(&out_state->motor_status);
+            /*
+             * 第 3 行显示 UART3/MOTOR 发送统计。
+             * Uart_AppGetStats() 没有失败返回值，清零后读取即可得到确定快照。
+             */
+            memset(&out_state->motor_uart_stats, 0, sizeof(out_state->motor_uart_stats));
+            Uart_AppGetStats(UART_DRIVER_PORT_MOTOR, &out_state->motor_uart_stats);
+            out_state->has_motor_uart_stats = true;
             break;
 
         default:
@@ -189,6 +206,37 @@ static bool Oled_AppAppendHexByte(char *out_text, size_t *cursor, uint8_t value)
 }
 
 /**
+ * @brief  向固定宽度行缓冲追加两位无符号十进制数。
+ *
+ * @note   用于显示 UART 超时/拒绝等小计数；超过 99 时钳位为 99，
+ *         避免诊断计数过大挤掉同一行后续字段。
+ *
+ * @param  out_text 输出行缓冲区。
+ * @param  cursor   当前写入列，成功写入后前移 2 列。
+ * @param  value    待显示数值。
+ * @return true 表示写入成功；false 表示参数无效或空间不足。
+ */
+static bool Oled_AppAppendUnsigned2(char *out_text, size_t *cursor, uint32_t value)
+{
+    /* OLED 诊断行只预留两位，超过 99 时显示 99 表示计数已经溢出观察范围。 */
+    if (value > 99U)
+    {
+        /* 钳位到两位十进制可显示的最大值。 */
+        value = 99U;
+    }
+
+    /* 先追加十位，再追加个位。 */
+    if (Oled_AppAppendChar(out_text, cursor, (char)('0' + (char)(value / 10U))) == false)
+    {
+        /* 行宽不足。 */
+        return false;
+    }
+
+    /* 追加个位并返回结果。 */
+    return Oled_AppAppendChar(out_text, cursor, (char)('0' + (char)(value % 10U)));
+}
+
+/**
  * @brief  向固定宽度行缓冲追加定宽有符号整数。
  *
  * @note   不使用 sprintf，避免在 MCU 端引入较重的格式化依赖。
@@ -281,7 +329,7 @@ static bool Oled_AppAppendSignedNumber(char *out_text, size_t *cursor,
  *
  * @note   输出始终为 21 个可见字符加结束符，调用者可以直接整行写屏。
  *
- * @param  line_index 行号，0~3 分别对应标题/灰度/电机 AB/电机 CD。
+ * @param  line_index 行号，0~3 分别对应按键诊断/电机 AB/电机 CD/UART3 统计。
  * @param  state      显示状态快照。
  * @param  out_text   输出文本缓冲。
  * @param  out_size   输出缓冲大小，必须至少为 OLED_APP_TEXT_COLUMNS + 1。
@@ -309,33 +357,52 @@ bool Oled_AppFormatLine(uint8_t line_index, const oled_app_display_state_t *stat
     switch (line_index)
     {
         case 0U:
-            /* 第 0 行显示固定标题和当前按键掩码。 */
-            ok = Oled_AppAppendText(out_text, &cursor, "MSPM0 K=");
-            ok = (ok && Oled_AppAppendHexByte(out_text, &cursor, state->key_mask));
-            break;
-
-        case 1U:
             if (state->has_line_snapshot == true)
             {
-                /* 第 1 行显示灰度 bit mask 和位置误差。 */
-                ok = Oled_AppAppendText(out_text, &cursor, "GRAY=");
+                /*
+                 * 保留 line_snapshot 字段的兼容性，但当前调试页面不再显示灰度。
+                 * 这里不读取该字段，避免旧测试或外部构造状态影响按键诊断显示。
+                 */
+            }
+
+            /* 第 0 行显示按键掩码、点动选择通道和最近一次发送结果。 */
+            ok = Oled_AppAppendText(out_text, &cursor, "KEY=");
+            if (state->has_motor_status == true)
+            {
+                /* 电机状态有效时，以电机任务实际消费到的按键掩码为准。 */
                 ok = (ok && Oled_AppAppendHexByte(out_text, &cursor,
-                    state->line_snapshot.bit_mask));
-                ok = (ok && Oled_AppAppendText(out_text, &cursor, " E="));
-                ok = (ok && Oled_AppAppendSignedNumber(out_text, &cursor,
-                    state->line_snapshot.position_error, 5U));
+                    state->motor_status.identify_key_mask));
             }
             else
             {
-                /* 灰度快照无效时显示等待状态。 */
-                ok = Oled_AppAppendText(out_text, &cursor, "GRAY=WAIT");
+                /* 电机状态无效时退回显示按键模块当前读数，便于定位任务未初始化。 */
+                ok = (ok && Oled_AppAppendHexByte(out_text, &cursor, state->key_mask));
             }
+
+            ok = (ok && Oled_AppAppendText(out_text, &cursor, " SEL="));
+            if ((state->has_motor_status == true) &&
+                (state->motor_status.identify_selected_motor < MOTOR_PROTOCOL_MOTOR_COUNT))
+            {
+                /* 有效通道用 0~3 显示，分别对应电机 A~D 的协议索引。 */
+                ok = (ok && Oled_AppAppendChar(out_text, &cursor,
+                    (char)('0' + state->motor_status.identify_selected_motor)));
+            }
+            else
+            {
+                /* 无键、多键或状态无效时显示 '-'，避免误以为选择了某一路。 */
+                ok = (ok && Oled_AppAppendChar(out_text, &cursor, '-'));
+            }
+
+            ok = (ok && Oled_AppAppendText(out_text, &cursor, " OK="));
+            ok = (ok && Oled_AppAppendChar(out_text, &cursor,
+                ((state->has_motor_status == true) &&
+                 (state->motor_status.identify_last_send_ok == true)) ? '1' : '0'));
             break;
 
-        case 2U:
+        case 1U:
             if (state->has_motor_status == true)
             {
-                /* 第 2 行显示 A/B 两路目标速度。 */
+                /* 第 1 行显示 A/B 两路目标速度，对照 K1/K2 返回结果。 */
                 ok = Oled_AppAppendText(out_text, &cursor, "VA=");
                 ok = (ok && Oled_AppAppendSignedNumber(out_text, &cursor,
                     state->motor_status.desired_speed[0], 5U));
@@ -345,17 +412,38 @@ bool Oled_AppFormatLine(uint8_t line_index, const oled_app_display_state_t *stat
             }
             break;
 
-        case 3U:
+        case 2U:
         default:
             if (state->has_motor_status == true)
             {
-                /* 第 3 行显示 C/D 两路目标速度。 */
+                /* 第 2 行显示 C/D 两路目标速度，对照 K3/K4 返回结果。 */
                 ok = Oled_AppAppendText(out_text, &cursor, "VC=");
                 ok = (ok && Oled_AppAppendSignedNumber(out_text, &cursor,
                     state->motor_status.desired_speed[2], 5U));
                 ok = (ok && Oled_AppAppendText(out_text, &cursor, " VD="));
                 ok = (ok && Oled_AppAppendSignedNumber(out_text, &cursor,
                     state->motor_status.desired_speed[3], 5U));
+            }
+            break;
+
+        case 3U:
+            if (state->has_motor_uart_stats == true)
+            {
+                /* 第 3 行显示 UART3 成功发送、发送超时和拒绝发送次数。 */
+                ok = Oled_AppAppendText(out_text, &cursor, "TX=");
+                ok = (ok && Oled_AppAppendSignedNumber(out_text, &cursor,
+                    (int32_t)state->motor_uart_stats.tx_packet_count, 3U));
+                ok = (ok && Oled_AppAppendText(out_text, &cursor, " TO="));
+                ok = (ok && Oled_AppAppendUnsigned2(out_text, &cursor,
+                    state->motor_uart_stats.tx_timeout_count));
+                ok = (ok && Oled_AppAppendText(out_text, &cursor, " RJ="));
+                ok = (ok && Oled_AppAppendUnsigned2(out_text, &cursor,
+                    state->motor_uart_stats.tx_reject_count));
+            }
+            else
+            {
+                /* UART 统计无效时给出明确等待文本，避免空白行误导排查。 */
+                ok = Oled_AppAppendText(out_text, &cursor, "TX=--- TO=-- RJ=--");
             }
             break;
     }
@@ -365,58 +453,102 @@ bool Oled_AppFormatLine(uint8_t line_index, const oled_app_display_state_t *stat
 }
 
 /**
- * @brief  刷新指定 OLED 行。
+ * @brief  刷新当前 OLED 字符分片。
  *
- * @note   本函数先构造固定宽度行文本，再调用底层一次性写出整行字符串。
+ * @note   本函数每次只写一个 6x8 字符，最多产生 1 次定位和 6 字节字模写入。
+ *         这样 OLED 任务不会因为整行 21 字符刷新而长时间阻塞 LED 和电机任务。
  *
- * @param  line_index 行号，0~3。
- * @return true 表示本次行刷新成功或无需刷新；false 表示底层 I2C 写失败。
+ * @param  无。
+ * @return true 表示当前字符写入成功；false 表示底层 I2C 写失败。
  */
-static bool Oled_AppRefreshLine(uint8_t line_index)
+static bool Oled_AppRefreshNextChar(void)
 {
-    /* 保存一次刷新所需的跨模块状态快照。 */
-    oled_app_display_state_t state;
+    /*
+     * 显示状态快照使用 static 存储，避免每次调用在栈上分配 132 字节。
+     * MSPM0G3507 默认栈仅 256 字节，原来的局部变量导致栈溢出 → HardFault → 卡死。
+     */
+    static oled_app_display_state_t state;
     /* 固定宽度行文本，多 1 字节放字符串结束符。 */
-    char line_text[OLED_APP_TEXT_COLUMNS + 1U];
+    static char line_text[OLED_APP_TEXT_COLUMNS + 1U];
+    /* 当前字符写入的像素列坐标。 */
+    uint8_t x;
+    /* 当前需要写入的字符。 */
+    char ch;
 
-    /* 采集当前行需要的显示状态。 */
-    Oled_AppBuildDisplayState(line_index, &state);
-    /* 格式化成功后整行写屏；失败时跳过本次刷新，避免写出半行内容。 */
-    if (Oled_AppFormatLine(line_index, &state, line_text, sizeof(line_text)) == true)
+    /* 行号或列号异常时回到第 0 行第 0 字符，防止状态越界后长期无法刷新。 */
+    if ((s_oled_refresh_slice >= 4U) || (s_oled_refresh_column >= OLED_APP_TEXT_COLUMNS))
     {
-        /* 以 6x8 字符一次写出整行文本，减少 I2C 事务。 */
-        return Oled_DriverShowString(0U, line_index, line_text);
+        /* 状态恢复到刷新起点。 */
+        s_oled_refresh_slice = 0U;
+        s_oled_refresh_column = 0U;
     }
 
-    /* 格式化失败时没有访问 I2C，总线状态不受影响。 */
+    /* 采集当前行需要的显示状态。 */
+    Oled_AppBuildDisplayState(s_oled_refresh_slice, &state);
+    /* 格式化失败时不访问 I2C，但仍推进到下一个字符，避免卡在坏格式分片。 */
+    if (Oled_AppFormatLine(s_oled_refresh_slice, &state, line_text, sizeof(line_text)) == false)
+    {
+        /* 当前分片视为跳过成功。 */
+        return true;
+    }
+
+    /* 计算当前字符对应的 OLED 像素列坐标。 */
+    x = (uint8_t)(s_oled_refresh_column * 6U);
+    /* 读取当前要显示的固定宽度字符，包含尾部空格用于覆盖旧内容。 */
+    ch = line_text[s_oled_refresh_column];
+
+    /* 写入一个字符，失败时由调用者进入退避且不推进分片。 */
+    if (Oled_DriverShowChar(x, s_oled_refresh_slice, ch) == false)
+    {
+        /* I2C 写失败。 */
+        return false;
+    }
+
+    /* 当前字符写入成功后推进列索引。 */
+    s_oled_refresh_column++;
+    if (s_oled_refresh_column >= OLED_APP_TEXT_COLUMNS)
+    {
+        /* 当前行刷新完成，下一次从下一行第 0 个字符开始。 */
+        s_oled_refresh_column = 0U;
+        s_oled_refresh_slice++;
+        if (s_oled_refresh_slice >= 4U)
+        {
+            /* 四行刷新完成后回到第 0 行。 */
+            s_oled_refresh_slice = 0U;
+        }
+    }
+
+    /* 当前字符刷新成功。 */
     return true;
 }
 
 /**
  * @brief  初始化 OLED 应用层。
  *
- * @note   初始化驱动并清屏；如果硬件未连接，底层 I2C 会超时返回，但系统仍继续运行。
+ * @note   启动阶段只初始化应用层状态，不直接访问 I2C。
+ *         OLED 的真实硬件初始化延后到 Oled_AppTask() 中执行，避免 OLED 接线异常或
+ *         I2C 总线异常时阻塞 System_Init()，导致 LED、按键、电机和陀螺仪任务都无法启动。
  *
  * @param  无。
  * @return 无。
  */
 void Oled_AppInit(void)
 {
-    /* 执行 SSD1306 初始化序列。 */
-    Oled_DriverInit();
-    /* 只有最近一次 I2C 访问成功时才认为 OLED 可周期刷新。 */
-    s_oled_ready = Oled_DriverIsAvailable();
+    /* 上电阶段先认为 OLED 未就绪，后续由低频 OLED 任务尝试硬件初始化。 */
+    s_oled_ready = false;
     /* 下一次任务从第 0 行开始刷新。 */
     s_oled_force_refresh = true;
     /* 清空分片状态。 */
     s_oled_refresh_slice = 0U;
+    /* 从当前行第 0 个字符开始刷新。 */
+    s_oled_refresh_column = 0U;
     /* 清空刷新分频计数。 */
     s_oled_refresh_divider = 0U;
     /*
-     * 初始化失败时进入退避。这样未接 OLED 的车不会在每个刷新周期反复等待 I2C 超时；
-     * 后续周期仍会按退避间隔重试初始化，以支持运行中接回屏幕。
+     * 让第一次 OLED 任务立即尝试初始化。
+     * 这样 System_Init() 不会被 OLED I2C 阻塞，但调度器启动后仍会尽快恢复显示。
      */
-    s_oled_error_backoff = (s_oled_ready == true) ? 0U : OLED_APP_ERROR_BACKOFF_TICKS;
+    s_oled_error_backoff = 1U;
 }
 
 /**
@@ -459,12 +591,21 @@ void Oled_AppTask(void)
             return;
         }
 
+        /* 初始化成功后清屏，消除上电 GDDRAM 随机数据（下半屏花屏）。 */
+        (void)Oled_DriverClear();
+
         /* 重试成功后从第 0 行开始刷新，并跳过普通分频。 */
         s_oled_force_refresh = true;
         /* 从标题行开始恢复显示内容。 */
         s_oled_refresh_slice = 0U;
+        /* 从行首字符开始恢复显示内容。 */
+        s_oled_refresh_column = 0U;
         /* 清空普通刷新分频计数。 */
         s_oled_refresh_divider = 0U;
+        /*
+         * 本次任务完成初始化和清屏，返回后让 LED/电机等任务先获得调度机会。
+         */
+        return;
     }
 
     /* 未初始化成功时不访问 OLED。 */
@@ -492,52 +633,28 @@ void Oled_AppTask(void)
     /* 强制刷新只影响启动第一个分片，进入后恢复普通分频。 */
     s_oled_force_refresh = false;
 
-    /* 根据分片编号刷新一行。 */
-    switch (s_oled_refresh_slice)
+    /*
+     * 一次任务写完全部 4 行 × 21 字符，调用者不会看到逐字刷新过程。
+     * 单次 I2C 总耗时约 52ms（84字符 × 630μs），在 250ms 任务周期内可以接受。
+     */
+    for (uint8_t n = 0U; n < (4U * OLED_APP_TEXT_COLUMNS); n++)
     {
-        case 0U:
-            /* 刷新标题和按键状态。 */
-            refresh_ok = Oled_AppRefreshLine(0U);
-            break;
+        refresh_ok = Oled_AppRefreshNextChar();
 
-        case 1U:
-            /* 刷新灰度循迹状态。 */
-            refresh_ok = Oled_AppRefreshLine(1U);
-            break;
-
-        case 2U:
-            /* 刷新 A/B 电机速度。 */
-            refresh_ok = Oled_AppRefreshLine(2U);
-            break;
-
-        case 3U:
-        default:
-            /* 刷新 C/D 电机速度。 */
-            refresh_ok = Oled_AppRefreshLine(3U);
-            break;
+        /* I2C 写失败时立即进入退避，不继续本行剩余字符。 */
+        if (refresh_ok == false)
+        {
+            /* 标记 OLED 当前不可用。 */
+            s_oled_ready = false;
+            /* 设置失败退避窗口。 */
+            s_oled_error_backoff = OLED_APP_ERROR_BACKOFF_TICKS;
+            /* 下次恢复时从当前行继续或由初始化重置到第 0 行。 */
+            s_oled_force_refresh = true;
+            return;
+        }
     }
 
-    /* I2C 写失败时进入退避，避免下一轮继续长时间超时。 */
-    if (refresh_ok == false)
-    {
-        /* 标记 OLED 当前不可用。 */
-        s_oled_ready = false;
-        /* 设置失败退避窗口。 */
-        s_oled_error_backoff = OLED_APP_ERROR_BACKOFF_TICKS;
-        /* 下次恢复时从当前行继续或由初始化重置到第 0 行。 */
-        s_oled_force_refresh = true;
-        /* 本次失败后不推进分片，保留当前行等待后续重试。 */
-        return;
-    }
-
-    /* 移动到下一行分片。 */
-    s_oled_refresh_slice++;
-    /* 四行刷新完成后回到第 0 行。 */
-    if (s_oled_refresh_slice >= 4U)
-    {
-        /* 重置分片编号。 */
-        s_oled_refresh_slice = 0U;
-    }
+    /* 整行刷新成功，分片推进已经在 Oled_AppRefreshNextChar() 内完成。 */
 }
 
 /**

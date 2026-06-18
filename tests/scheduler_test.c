@@ -1,9 +1,9 @@
 /**
  * @file    scheduler_test.c
- * @brief   调度器任务顺序、deadline 周期推进和运行统计的主机端测试。
+ * @brief   简化轮询调度器的主机端测试。
  *
  * @details 本测试通过桩任务替代真实 App 任务，直接驱动 Scheduler_Run()。
- *          测试目标是验证调度器核心时序行为，不访问 MCU 寄存器或外设。
+ *          测试目标是验证“任务函数 + 周期 + 上次运行时间”的简单调度行为。
  */
 
 #include <assert.h>
@@ -11,13 +11,35 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* 主机测试打开循迹任务，覆盖任务表中最短 1ms 周期路径。 */
+#ifndef SCHEDULER_ENABLE_LINE_TRACK_TASK
+#define SCHEDULER_ENABLE_LINE_TRACK_TASK    (1)
+#endif
+
 #include "scheduler.h"
 
-/* 记录一次任务调用，便于验证调度器扫描顺序是否符合实时性优先级。 */
+/**
+ * @brief  测试用任务 ID。
+ *
+ * @note   生产调度器已经不再暴露任务 ID；测试内部保留 ID 只用于断言调用顺序。
+ */
+typedef enum
+{
+    SCHEDULER_TEST_TASK_LINE_TRACK = 0,  /* 灰度循迹桩任务。 */
+    SCHEDULER_TEST_TASK_GYRO,            /* 陀螺仪桩任务。 */
+    SCHEDULER_TEST_TASK_MOTOR,           /* 电机桩任务。 */
+    SCHEDULER_TEST_TASK_KEY,             /* 按键桩任务。 */
+    SCHEDULER_TEST_TASK_UART,            /* UART 桩任务。 */
+    SCHEDULER_TEST_TASK_OLED,            /* OLED 桩任务。 */
+    SCHEDULER_TEST_TASK_LED,             /* LED 桩任务。 */
+    SCHEDULER_TEST_TASK_COUNT            /* 测试任务数量。 */
+} scheduler_test_task_id_t;
+
+/* 记录一次任务调用，便于验证调度器扫描顺序和触发时刻。 */
 typedef struct
 {
-    scheduler_task_id_t task_id;  /* 被调用的任务 ID。 */
-    uint32_t tick_ms;             /* 任务开始执行时的调度器 tick。 */
+    scheduler_test_task_id_t task_id;    /* 被调用的测试任务 ID。 */
+    uint32_t tick_ms;                    /* 任务开始执行时的调度器 tick。 */
 } scheduler_test_call_t;
 
 /* 调用日志容量覆盖本测试内的所有任务调用次数。 */
@@ -29,8 +51,8 @@ static scheduler_test_call_t s_calls[SCHEDULER_TEST_CALL_CAPACITY];
 /* 当前调用日志中的有效记录数量。 */
 static uint8_t s_call_count;
 
-/* 各任务模拟耗时，桩任务执行时直接推进 uwTick，用于测试运行统计。 */
-static uint32_t s_task_cost_ms[SCHEDULER_TASK_ID_COUNT];
+/* 各任务模拟耗时，桩任务执行时直接推进 uwTick，用于验证后续任务读取新 tick。 */
+static uint32_t s_task_cost_ms[SCHEDULER_TEST_TASK_COUNT];
 
 /**
  * @brief  清空测试桩状态。
@@ -44,7 +66,7 @@ static void SchedulerTest_ResetStubs(void)
     s_call_count = 0U;
 
     /* 默认所有任务执行耗时为 0，单个测试可按需覆盖。 */
-    for (uint8_t i = 0U; i < (uint8_t)SCHEDULER_TASK_ID_COUNT; i++)
+    for (uint8_t i = 0U; i < (uint8_t)SCHEDULER_TEST_TASK_COUNT; i++)
     {
         s_task_cost_ms[i] = 0U;
     }
@@ -53,15 +75,15 @@ static void SchedulerTest_ResetStubs(void)
 /**
  * @brief  记录桩任务调用并模拟任务耗时。
  *
- * @param  task_id 当前被调度的任务 ID。
+ * @param  task_id 当前被调度的测试任务 ID。
  * @return 无。
  */
-static void SchedulerTest_RecordTask(scheduler_task_id_t task_id)
+static void SchedulerTest_RecordTask(scheduler_test_task_id_t task_id)
 {
     /* 调用日志容量固定，超出容量说明测试用例设计错误。 */
     assert(s_call_count < SCHEDULER_TEST_CALL_CAPACITY);
 
-    /* 记录本次任务 ID 和开始 tick，用于后续顺序和耗时断言。 */
+    /* 记录本次任务 ID 和开始 tick，用于后续顺序断言。 */
     s_calls[s_call_count].task_id = task_id;
     s_calls[s_call_count].tick_ms = Scheduler_GetTick();
     s_call_count++;
@@ -71,39 +93,6 @@ static void SchedulerTest_RecordTask(scheduler_task_id_t task_id)
 }
 
 /**
- * @brief  逐毫秒推进调度器到指定 tick，并丢弃推进过程中的调用日志。
- *
- * @param  target_tick 需要推进到的目标 tick，必须不早于当前 tick。
- * @return 无。
- */
-static void SchedulerTest_AdvanceToTick(uint32_t target_tick)
-{
-    /* 从当前 tick 开始逐步推进，避免直接跳时把历史到期任务挤到同一轮。 */
-    uint32_t tick = Scheduler_GetTick();
-
-    /* 每推进 1ms 就运行一次调度器，模拟真实主循环持续扫描的稳态行为。 */
-    while ((uint32_t)(target_tick - tick) > 0U)
-    {
-        /* 推进到下一个毫秒 tick。 */
-        tick++;
-        /* 测试中直接写 uwTick，模拟 SysTick 中断已经发生。 */
-        uwTick = tick;
-        /* 执行本毫秒的调度扫描。 */
-        (void)Scheduler_Run();
-        /* 丢弃推进过程日志，只保留调用者后续手动扫描的断言数据。 */
-        s_call_count = 0U;
-    }
-}
-
-/**
- * @brief  读取调度器本轮以来的任务表扫描次数。
- *
- * @param  无。
- * @return 调度器内部累计扫描任务表项的次数。
- */
-uint32_t Scheduler_GetScanCountForTest(void);
-
-/**
  * @brief  LED 桩任务。
  *
  * @param  无。
@@ -111,7 +100,7 @@ uint32_t Scheduler_GetScanCountForTest(void);
  */
 void Led_AppTask(void)
 {
-    SchedulerTest_RecordTask(SCHEDULER_TASK_ID_LED);
+    SchedulerTest_RecordTask(SCHEDULER_TEST_TASK_LED);
 }
 
 /**
@@ -122,7 +111,7 @@ void Led_AppTask(void)
  */
 void Key_AppTask(void)
 {
-    SchedulerTest_RecordTask(SCHEDULER_TASK_ID_KEY);
+    SchedulerTest_RecordTask(SCHEDULER_TEST_TASK_KEY);
 }
 
 /**
@@ -133,7 +122,7 @@ void Key_AppTask(void)
  */
 void Uart_AppTask(void)
 {
-    SchedulerTest_RecordTask(SCHEDULER_TASK_ID_UART);
+    SchedulerTest_RecordTask(SCHEDULER_TEST_TASK_UART);
 }
 
 /**
@@ -144,7 +133,7 @@ void Uart_AppTask(void)
  */
 void Gyro_AppTask(void)
 {
-    SchedulerTest_RecordTask(SCHEDULER_TASK_ID_GYRO);
+    SchedulerTest_RecordTask(SCHEDULER_TEST_TASK_GYRO);
 }
 
 /**
@@ -155,7 +144,7 @@ void Gyro_AppTask(void)
  */
 void LineTrack_AppTask(void)
 {
-    SchedulerTest_RecordTask(SCHEDULER_TASK_ID_LINE_TRACK);
+    SchedulerTest_RecordTask(SCHEDULER_TEST_TASK_LINE_TRACK);
 }
 
 /**
@@ -166,7 +155,7 @@ void LineTrack_AppTask(void)
  */
 void Motor_AppTask(void)
 {
-    SchedulerTest_RecordTask(SCHEDULER_TASK_ID_MOTOR);
+    SchedulerTest_RecordTask(SCHEDULER_TEST_TASK_MOTOR);
 }
 
 /**
@@ -177,16 +166,16 @@ void Motor_AppTask(void)
  */
 void Oled_AppTask(void)
 {
-    SchedulerTest_RecordTask(SCHEDULER_TASK_ID_OLED);
+    SchedulerTest_RecordTask(SCHEDULER_TEST_TASK_OLED);
 }
 
 /**
- * @brief  验证实时性关键任务先于低优先级显示和 LED 任务执行。
+ * @brief  验证初始化后未到周期时不运行任务。
  *
  * @param  无。
  * @return 无。
  */
-static void test_realtime_tasks_run_before_low_priority_tasks(void)
+static void test_scheduler_returns_false_when_no_task_is_due(void)
 {
     bool has_task_run;
 
@@ -194,28 +183,110 @@ static void test_realtime_tasks_run_before_low_priority_tasks(void)
     uwTick = 0U;
     Scheduler_Init();
 
-    /* 推进到所有任务的首次 deadline 都已到期，便于一次扫描验证完整顺序。 */
-    uwTick = 263U;
+    /* 初始化后所有任务 last_time 都是 0，0ms 立即扫描不应触发任何任务。 */
+    has_task_run = Scheduler_Run();
+
+    assert(has_task_run == false);
+    assert(s_call_count == 0U);
+}
+
+/**
+ * @brief  验证 1ms 时只运行最短周期的循迹任务。
+ *
+ * @param  无。
+ * @return 无。
+ */
+static void test_scheduler_runs_only_due_tasks(void)
+{
+    bool has_task_run;
+
+    SchedulerTest_ResetStubs();
+    uwTick = 0U;
+    Scheduler_Init();
+
+    /* 1ms 时只有 1ms 周期任务到期，5ms/20ms/100ms/250ms 任务都不应运行。 */
+    uwTick = 1U;
+    has_task_run = Scheduler_Run();
+
+    assert(has_task_run == true);
+    assert(s_call_count == 1U);
+    assert(s_calls[0].task_id == SCHEDULER_TEST_TASK_LINE_TRACK);
+    assert(s_calls[0].tick_ms == 1U);
+}
+
+/**
+ * @brief  验证同一 tick 中到期任务按任务表顺序运行。
+ *
+ * @param  无。
+ * @return 无。
+ */
+static void test_scheduler_runs_due_tasks_in_table_order(void)
+{
+    bool has_task_run;
+
+    SchedulerTest_ResetStubs();
+    uwTick = 0U;
+    Scheduler_Init();
+
+    /*
+     * 250ms 时所有任务周期都已到期。
+     * 简化调度器不再做错峰，所有到期任务在同一轮按任务表顺序运行。
+     */
+    uwTick = 250U;
     has_task_run = Scheduler_Run();
 
     assert(has_task_run == true);
     assert(s_call_count == 7U);
-    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
-    assert(s_calls[1].task_id == SCHEDULER_TASK_ID_GYRO);
-    assert(s_calls[2].task_id == SCHEDULER_TASK_ID_MOTOR);
-    assert(s_calls[3].task_id == SCHEDULER_TASK_ID_KEY);
-    assert(s_calls[4].task_id == SCHEDULER_TASK_ID_UART);
-    assert(s_calls[5].task_id == SCHEDULER_TASK_ID_OLED);
-    assert(s_calls[6].task_id == SCHEDULER_TASK_ID_LED);
+    assert(s_calls[0].task_id == SCHEDULER_TEST_TASK_LINE_TRACK);
+    assert(s_calls[1].task_id == SCHEDULER_TEST_TASK_GYRO);
+    assert(s_calls[2].task_id == SCHEDULER_TEST_TASK_MOTOR);
+    assert(s_calls[3].task_id == SCHEDULER_TEST_TASK_KEY);
+    assert(s_calls[4].task_id == SCHEDULER_TEST_TASK_UART);
+    assert(s_calls[5].task_id == SCHEDULER_TEST_TASK_OLED);
+    assert(s_calls[6].task_id == SCHEDULER_TEST_TASK_LED);
 }
 
 /**
- * @brief  验证低优先级任务使用初始错峰，避免所有任务在同一 tick 集中运行。
+ * @brief  验证任务运行后会用本次 tick 更新 last_time。
  *
  * @param  无。
  * @return 无。
  */
-static void test_scheduler_staggers_low_priority_initial_deadlines(void)
+static void test_scheduler_updates_last_time_after_run(void)
+{
+    bool has_task_run;
+
+    SchedulerTest_ResetStubs();
+    uwTick = 0U;
+    Scheduler_Init();
+
+    /* 5ms 时 1ms 和 5ms 任务运行。 */
+    uwTick = 5U;
+    has_task_run = Scheduler_Run();
+    assert(has_task_run == true);
+    assert(s_call_count == 4U);
+
+    /* 同一个 tick 再扫一次，因为 last_time 已更新，不应重复运行。 */
+    s_call_count = 0U;
+    has_task_run = Scheduler_Run();
+    assert(has_task_run == false);
+    assert(s_call_count == 0U);
+
+    /* 到 6ms 时，只有 1ms 任务距离上次运行满 1ms。 */
+    uwTick = 6U;
+    has_task_run = Scheduler_Run();
+    assert(has_task_run == true);
+    assert(s_call_count == 1U);
+    assert(s_calls[0].task_id == SCHEDULER_TEST_TASK_LINE_TRACK);
+}
+
+/**
+ * @brief  验证前序任务耗时会被后续任务读取到。
+ *
+ * @param  无。
+ * @return 无。
+ */
+static void test_scheduler_reads_tick_before_each_task(void)
 {
     bool has_task_run;
 
@@ -224,232 +295,49 @@ static void test_scheduler_staggers_low_priority_initial_deadlines(void)
     Scheduler_Init();
 
     /*
-     * 逐毫秒推进到 99ms，建立真实稳态 deadline。
-     * 100ms 时只允许 1ms 和 5ms 任务到期，低优先级 UART/LED/OLED 不应挤在整百毫秒。
+     * 循迹任务模拟耗时 4ms。
+     * 调度器每个任务判定前重新读取 tick，因此后面的 5ms 任务能看到 tick 已到 5ms。
      */
-    SchedulerTest_AdvanceToTick(99U);
-    uwTick = 100U;
+    s_task_cost_ms[SCHEDULER_TEST_TASK_LINE_TRACK] = 4U;
+    uwTick = 1U;
     has_task_run = Scheduler_Run();
 
     assert(has_task_run == true);
     assert(s_call_count == 4U);
-    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
-    assert(s_calls[1].task_id == SCHEDULER_TASK_ID_GYRO);
-    assert(s_calls[2].task_id == SCHEDULER_TASK_ID_MOTOR);
-    assert(s_calls[3].task_id == SCHEDULER_TASK_ID_KEY);
-
-    /*
-     * UART 使用 2ms 初始相位偏移，102ms 时应只和 1ms 任务同轮运行，
-     * 避开 5ms 串口/按键任务和整百毫秒心跳任务。
-     */
-    SchedulerTest_AdvanceToTick(101U);
-    s_call_count = 0U;
-    uwTick = 102U;
-    has_task_run = Scheduler_Run();
-
-    assert(has_task_run == true);
-    assert(s_call_count == 2U);
-    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
-    assert(s_calls[1].task_id == SCHEDULER_TASK_ID_UART);
-
-    /*
-     * LED 使用 7ms 初始相位偏移，107ms 时应只和 1ms 任务同轮运行。
-     */
-    SchedulerTest_AdvanceToTick(106U);
-    s_call_count = 0U;
-    uwTick = 107U;
-    has_task_run = Scheduler_Run();
-
-    assert(has_task_run == true);
-    assert(s_call_count == 2U);
-    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
-    assert(s_calls[1].task_id == SCHEDULER_TASK_ID_LED);
-
-    /*
-     * OLED 使用 13ms 初始相位偏移，263ms 时应只和 1ms 任务同轮运行。
-     */
-    SchedulerTest_AdvanceToTick(262U);
-    s_call_count = 0U;
-    uwTick = 263U;
-    has_task_run = Scheduler_Run();
-
-    assert(has_task_run == true);
-    assert(s_call_count == 2U);
-    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
-    assert(s_calls[1].task_id == SCHEDULER_TASK_ID_OLED);
+    assert(s_calls[0].task_id == SCHEDULER_TEST_TASK_LINE_TRACK);
+    assert(s_calls[0].tick_ms == 1U);
+    assert(s_calls[1].task_id == SCHEDULER_TEST_TASK_GYRO);
+    assert(s_calls[1].tick_ms == 5U);
+    assert(s_calls[2].task_id == SCHEDULER_TEST_TASK_MOTOR);
+    assert(s_calls[2].tick_ms == 5U);
+    assert(s_calls[3].task_id == SCHEDULER_TEST_TASK_KEY);
+    assert(s_calls[3].tick_ms == 5U);
 }
 
 /**
- * @brief  验证无任务到期时调度器通过最早 deadline 快速返回，不扫描任务表。
+ * @brief  验证 tick 回绕时仍能通过无符号差值触发任务。
  *
  * @param  无。
  * @return 无。
  */
-static void test_scheduler_skips_task_scan_before_next_deadline(void)
+static void test_scheduler_handles_tick_wrap(void)
 {
     bool has_task_run;
-    uint32_t scan_count_before;
-    uint32_t scan_count_after;
 
     SchedulerTest_ResetStubs();
-    uwTick = 0U;
+    uwTick = 0xFFFFFFFEUL;
     Scheduler_Init();
 
-    /* 初始化后第一个任务 deadline 是 1ms；0ms 调用应直接快速返回。 */
-    scan_count_before = Scheduler_GetScanCountForTest();
-    has_task_run = Scheduler_Run();
-    scan_count_after = Scheduler_GetScanCountForTest();
-
-    assert(has_task_run == false);
-    assert(s_call_count == 0U);
-    assert(scan_count_after == scan_count_before);
-
-    /* 到达 1ms 后需要扫描并运行灰度任务，证明快速路径不会漏掉到期任务。 */
-    uwTick = 1U;
-    has_task_run = Scheduler_Run();
-    scan_count_after = Scheduler_GetScanCountForTest();
-
-    assert(has_task_run == true);
-    assert(s_call_count >= 1U);
-    assert(scan_count_after > scan_count_before);
-    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
-}
-
-/**
- * @brief  验证 deadline 推进避免任务耗时造成周期基准漂移。
- *
- * @param  无。
- * @return 无。
- */
-static void test_scheduler_skips_backlog_after_overrun(void)
-{
-    bool has_task_run;
-#if SCHEDULER_ENABLE_STATS
-    scheduler_task_stats_t stats;
-#endif
-
-    SchedulerTest_ResetStubs();
-    uwTick = 0U;
-    Scheduler_Init();
-
-    /* 灰度循迹任务模拟耗时 3ms，超过自身 1ms 周期。 */
-    s_task_cost_ms[SCHEDULER_TASK_ID_LINE_TRACK] = 3U;
-
-    /* 第一次到期运行后，任务耗时超过周期。 */
-    uwTick = 1U;
-    has_task_run = Scheduler_Run();
-    assert(has_task_run == true);
-    assert(s_call_count >= 1U);
-    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
-
-    /*
-     * 当前 tick 已被桩任务推进到 4ms。
-     * 新策略只补偿一次并跳过积压周期，不能立刻再次运行 1ms 任务，
-     * 否则高频任务会把后续低频任务长期饿住。
-     */
-    s_call_count = 0U;
-    has_task_run = Scheduler_Run();
-    assert(has_task_run == false);
-    assert(s_call_count == 0U);
-
-#if SCHEDULER_ENABLE_STATS
-    assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
-    assert(stats.run_count == 1UL);
-    assert(stats.overrun_count == 1UL);
-    assert(stats.last_lateness_ms == 0UL);
-    assert(stats.max_lateness_ms == 0UL);
-    assert(stats.missed_deadline_count == 0UL);
-#endif
-}
-
-/**
- * @brief  验证长时间延迟后只执行一次任务，并记录迟到和跳过周期。
- *
- * @param  无。
- * @return 无。
- */
-static void test_scheduler_records_lateness_and_missed_periods(void)
-{
-    bool has_task_run;
-    scheduler_task_stats_t stats;
-
-    SchedulerTest_ResetStubs();
-    uwTick = 0U;
-    Scheduler_Init();
-
-    /*
-     * 灰度循迹任务原 deadline 为 1ms。直接推进到 150ms 后运行，
-     * 调度器应只调用一次该任务，并统计 149ms 迟到与 149 个被跳过周期。
-     */
-    uwTick = 150U;
+    /* tick 回绕到 3 后，距离初始化时刻已经过去 5ms，1ms 和 5ms 任务应运行。 */
+    uwTick = 3U;
     has_task_run = Scheduler_Run();
 
     assert(has_task_run == true);
-    assert(s_call_count >= 1U);
-    assert(s_calls[0].task_id == SCHEDULER_TASK_ID_LINE_TRACK);
-    assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
-#if SCHEDULER_ENABLE_STATS
-    assert(stats.run_count == 1UL);
-    assert(stats.last_lateness_ms == 149UL);
-    assert(stats.max_lateness_ms == 149UL);
-    assert(stats.missed_deadline_count == 149UL);
-#else
-    assert(stats.run_count == 0UL);
-    assert(stats.last_lateness_ms == 0UL);
-    assert(stats.max_lateness_ms == 0UL);
-    assert(stats.missed_deadline_count == 0UL);
-#endif
-}
-
-/**
- * @brief  验证调度器统计任务最大耗时和超期次数。
- *
- * @param  无。
- * @return 无。
- */
-static void test_scheduler_records_runtime_and_overrun_stats(void)
-{
-    bool has_task_run;
-    scheduler_task_stats_t stats;
-
-    SchedulerTest_ResetStubs();
-    uwTick = 0U;
-    Scheduler_Init();
-
-    /* 用 3ms 耗时触发灰度 1ms 任务超期统计。 */
-    s_task_cost_ms[SCHEDULER_TASK_ID_LINE_TRACK] = 3U;
-    uwTick = 1U;
-    has_task_run = Scheduler_Run();
-
-    assert(has_task_run == true);
-    assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
-#if SCHEDULER_ENABLE_STATS
-    assert(stats.run_count == 1UL);
-    assert(stats.max_runtime_ms == 3UL);
-    assert(stats.last_runtime_ms == 3UL);
-    assert(stats.overrun_count == 1UL);
-    assert(stats.last_lateness_ms == 0UL);
-    assert(stats.max_lateness_ms == 0UL);
-    assert(stats.missed_deadline_count == 0UL);
-#else
-    assert(stats.run_count == 0UL);
-    assert(stats.max_runtime_ms == 0UL);
-    assert(stats.last_runtime_ms == 0UL);
-    assert(stats.overrun_count == 0UL);
-    assert(stats.last_lateness_ms == 0UL);
-    assert(stats.max_lateness_ms == 0UL);
-    assert(stats.missed_deadline_count == 0UL);
-#endif
-
-    Scheduler_ClearTaskStats(SCHEDULER_TASK_ID_LINE_TRACK);
-    assert(Scheduler_GetTaskStats(SCHEDULER_TASK_ID_LINE_TRACK, &stats) == true);
-    assert(stats.run_count == 0UL);
-    assert(stats.max_runtime_ms == 0UL);
-    assert(stats.last_runtime_ms == 0UL);
-    assert(stats.overrun_count == 0UL);
-    assert(stats.last_lateness_ms == 0UL);
-    assert(stats.max_lateness_ms == 0UL);
-    assert(stats.missed_deadline_count == 0UL);
+    assert(s_call_count == 4U);
+    assert(s_calls[0].task_id == SCHEDULER_TEST_TASK_LINE_TRACK);
+    assert(s_calls[1].task_id == SCHEDULER_TEST_TASK_GYRO);
+    assert(s_calls[2].task_id == SCHEDULER_TEST_TASK_MOTOR);
+    assert(s_calls[3].task_id == SCHEDULER_TEST_TASK_KEY);
 }
 
 /**
@@ -460,12 +348,12 @@ static void test_scheduler_records_runtime_and_overrun_stats(void)
  */
 int main(void)
 {
-    test_realtime_tasks_run_before_low_priority_tasks();
-    test_scheduler_staggers_low_priority_initial_deadlines();
-    test_scheduler_skips_task_scan_before_next_deadline();
-    test_scheduler_skips_backlog_after_overrun();
-    test_scheduler_records_lateness_and_missed_periods();
-    test_scheduler_records_runtime_and_overrun_stats();
+    test_scheduler_returns_false_when_no_task_is_due();
+    test_scheduler_runs_only_due_tasks();
+    test_scheduler_runs_due_tasks_in_table_order();
+    test_scheduler_updates_last_time_after_run();
+    test_scheduler_reads_tick_before_each_task();
+    test_scheduler_handles_tick_wrap();
 
     printf("scheduler tests passed\n");
     return 0;
